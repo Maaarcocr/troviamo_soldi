@@ -1,4 +1,5 @@
 use crate::{
+    engine,
     model::{self, ModelClient},
     store::Store,
     types::{DocumentVersion, Notice, RunSummary, Usage},
@@ -109,7 +110,14 @@ pub fn run(
         let previous_extraction = if cached.is_some() && options.retry_failed {
             None
         } else {
-            previous.as_ref().and_then(|(_, e)| e.as_ref())
+            previous.as_ref().and_then(|(docs, extraction)| {
+                let sources: Vec<_> = std::iter::once(notice.source_url.clone())
+                    .chain(docs.iter().map(|d| d.url.clone()))
+                    .collect();
+                extraction
+                    .as_ref()
+                    .filter(|extraction| engine::validate_extraction(extraction, &sources).is_ok())
+            })
         };
         let previous_hashes: BTreeMap<&str, &str> = if previous_extraction.is_some() {
             previous
@@ -176,7 +184,9 @@ pub fn run(
                             })
                             .unwrap_or_default();
                         if !removed.is_empty() {
-                            extraction["needs_review"] = json!(true);
+                            if extraction["schema_version"] != 2 {
+                                extraction["needs_review"] = json!(true);
+                            }
                             extraction["review_reasons"].as_array_mut().unwrap().push(json!(format!("Previously supplied files are no longer listed: {}. Verify whether their requirements still apply.",removed.join(", "))));
                         }
                         let unsupported: Vec<_> = documents
@@ -185,17 +195,24 @@ pub fn run(
                             .map(|d| d.filename.clone())
                             .collect();
                         if !unsupported.is_empty() {
-                            extraction["needs_review"] = json!(true);
+                            if extraction["schema_version"] != 2 {
+                                extraction["needs_review"] = json!(true);
+                            }
                             extraction["review_reasons"].as_array_mut().unwrap().push(json!(format!("Original files not readable by this native PDF/image path: {}. Requirements may be incomplete.",unsupported.join(", "))));
                         }
 
-                        let state = if extraction["needs_review"] == true {
+                        let reasons = engine::extraction_review_reasons(&extraction);
+                        let source_uncertainty = extraction["review_reasons"]
+                            .as_array()
+                            .is_some_and(|a| !a.is_empty());
+                        let state = if source_uncertainty {
                             summary.needs_review += 1;
                             "needs_review"
                         } else {
                             summary.accepted += 1;
                             "screened"
                         };
+                        // An accepted extraction is not an eligible opportunity. The local matcher decides that.
                         store.finish_attempt(attempt, state, Some(&response), &usage, None)?;
                         store.finish_version(version, state, Some(&extraction), None)?;
                         eprintln!(
@@ -206,6 +223,9 @@ pub fn run(
                                 .map(|v| v.to_string())
                                 .unwrap_or_else(|| "unknown".into())
                         );
+                        for reason in reasons {
+                            eprintln!("  unresolved fact: {reason}");
+                        }
                     }
                     Err(error) => {
                         summary.needs_review += 1;

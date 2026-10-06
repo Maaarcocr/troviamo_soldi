@@ -114,6 +114,9 @@ fn numeric(value: &Value, name: &str, min: f64, max: f64) -> Result<f64> {
     Ok(number)
 }
 fn valid_value(value: &Value, definition: &Value) -> bool {
+    if let Some(values) = definition["canonical_values"].as_array() {
+        return values.contains(value);
+    }
     match definition["type"].as_str() {
         Some("boolean") => value.is_boolean(),
         Some("number") => value.as_f64().is_some_and(|v| {
@@ -168,12 +171,27 @@ fn rule_fields(rule: &Value) -> Vec<&str> {
 /// Enforces the schema *and* operator-specific types, references, dates, and scope.
 /// `allowed_sources` must come from the trusted call/configuration, not the model.
 pub fn validate_extraction(value: &Value, allowed_sources: &[String]) -> Result<()> {
-    validate_extraction_inner(value, allowed_sources, true)
+    if value["schema_version"] == 2 {
+        let normalized = crate::contract::to_legacy(value)?;
+        validate_extraction_inner(&normalized, Some(allowed_sources), false)
+    } else {
+        validate_extraction_inner(value, Some(allowed_sources), true)
+    }
+}
+
+/// Offline structural diagnosis only: does not authenticate citation destinations.
+/// Never use this to accept a live response or import recovered facts.
+pub fn validate_extraction_structure(value: &Value) -> Result<()> {
+    if value["schema_version"] == 2 {
+        validate_extraction_inner(&crate::contract::to_legacy(value)?, None, false)
+    } else {
+        validate_extraction_inner(value, None, true)
+    }
 }
 
 fn validate_extraction_inner(
     value: &Value,
-    allowed_sources: &[String],
+    allowed_sources: Option<&[String]>,
     require_deadline_review_flag: bool,
 ) -> Result<()> {
     closed_object(value, TOP_KEYS, "Extraction")?;
@@ -215,7 +233,7 @@ fn validate_extraction_inner(
         "needs_review must agree with review_reasons"
     );
     ensure!(
-        status != "unknown" || needs_review,
+        !require_deadline_review_flag || status != "unknown" || needs_review,
         "Unknown call status requires a review reason"
     );
     ensure!(
@@ -245,7 +263,7 @@ fn validate_extraction_inner(
             "Citation source must be an HTTP(S) URL"
         );
         ensure!(
-            allowed_sources.iter().any(|allowed| allowed == source),
+            allowed_sources.is_none_or(|sources| sources.iter().any(|allowed| allowed == source)),
             "Citation source is outside the supplied official source list: {source}"
         );
         text(&citation["locator"], "citation locator", 1, 1000)?;
@@ -260,238 +278,230 @@ fn validate_extraction_inner(
         "An empty requirement list requires review"
     );
     let mut ids = HashSet::new();
-    for rule in requirements {
-        closed_object(rule, RULE_KEYS, "Requirement")?;
-        let id = identifier(&rule["id"], "requirement id")?;
-        ensure!(ids.insert(id), "Duplicate requirement id: {id}");
-        text(&rule["label"], "requirement label", 1, 1000)?;
-        let op = enumeration(&rule["op"], OPS, "operator")?;
-        let scope = enumeration(&rule["scope"], SCOPES, "scope")?;
-        enumeration(
-            &rule["blocker"],
-            &["applicant", "project", "application"],
-            "blocker",
-        )?;
-        ensure!(
-            scope == "municipality" || rule["blocker"] != "applicant",
-            "Project/application evidence cannot exclude an applicant globally"
-        );
-        if !rule["note"].is_null() {
-            text(&rule["note"], "note", 1, 5000)?;
-        }
-        nullable_date(&rule["reference_date"], "reference_date")?;
-        if !rule["population_basis"].is_null() {
+    for (index, rule) in requirements.iter().enumerate() {
+        let mut validate_rule = || -> Result<()> {
+            closed_object(rule, RULE_KEYS, "Requirement")?;
+            let id = identifier(&rule["id"], "requirement id")?;
+            ensure!(ids.insert(id), "Duplicate requirement id: {id}");
+            text(&rule["label"], "requirement label", 1, 1000)?;
+            let op = enumeration(&rule["op"], OPS, "operator")?;
+            let scope = enumeration(&rule["scope"], SCOPES, "scope")?;
             enumeration(
-                &rule["population_basis"],
-                &["estimate", "resident", "legal"],
-                "population_basis",
+                &rule["blocker"],
+                &["applicant", "project", "application"],
+                "blocker",
             )?;
-        }
-        let references = rule["citation_ids"]
-            .as_array()
-            .context("citation_ids must be an array")?;
-        ensure!(
-            !references.is_empty() && references.len() <= 30,
-            "Each requirement needs 1–30 citations"
-        );
-        let mut seen = HashSet::new();
-        for reference in references {
-            let reference = reference.as_str().context("Citation id must be a string")?;
             ensure!(
-                citation_ids.contains(reference) && seen.insert(reference),
-                "Missing or duplicate citation reference: {reference}"
+                scope == "municipality" || rule["blocker"] != "applicant",
+                "Project/application evidence cannot exclude an applicant globally"
             );
-        }
-        if op == "manual" {
-            require_null(
-                rule,
-                &[
-                    "field",
-                    "value",
-                    "values",
-                    "min",
-                    "max",
-                    "left",
-                    "right",
-                    "relation",
-                    "days",
-                    "population_basis",
-                    "reference_date",
-                ],
-            )?;
-            text(&rule["note"], "manual note", 1, 5000)?;
-            continue;
-        }
-        if op == "compare" {
-            require_null(rule, &["field", "value", "values", "min", "max", "days"])?;
-            enumeration(&rule["relation"], &["lte", "gte"], "relation")?;
-            for side in ["left", "right"] {
-                let terms = rule[side]
-                    .as_array()
-                    .with_context(|| format!("{side} must be a term array"))?;
-                ensure!(
-                    !terms.is_empty() && terms.len() <= 20,
-                    "Comparison sides require 1–20 terms"
-                );
-                let mut seen = HashSet::new();
-                for term in terms {
-                    closed_object(term, &["field", "factor"], "Comparison term")?;
-                    let field = term["field"]
-                        .as_str()
-                        .context("Term field must be string")?;
-                    ensure!(
-                        definition(field)?["type"] == "number",
-                        "Comparison terms must be numeric fields"
-                    );
-                    ensure!(seen.insert(field), "Duplicate comparison field in one side");
-                    let factor = numeric(&term["factor"], "factor", 0.0, 1e6)?;
-                    ensure!(factor > 0.0, "Term factor must be positive");
-                }
+            if !rule["note"].is_null() {
+                text(&rule["note"], "note", 1, 5000)?;
             }
-        } else {
-            require_null(rule, &["left", "right", "relation"])?;
-            let field = rule["field"]
-                .as_str()
-                .context("field must be a supported field string")?;
-            let definition = definition(field)?;
-            match op {
-                "equals" => {
-                    require_null(rule, &["values", "min", "max", "days"])?;
-                    ensure!(
-                        valid_value(&rule["value"], definition),
-                        "equals value does not match its field type"
-                    );
-                }
-                "one_of" => {
-                    require_null(rule, &["value", "min", "max", "days"])?;
-                    let values = rule["values"]
+            nullable_date(&rule["reference_date"], "reference_date")?;
+            if !rule["population_basis"].is_null() {
+                enumeration(
+                    &rule["population_basis"],
+                    &["estimate", "resident", "legal"],
+                    "population_basis",
+                )?;
+            }
+            let references = rule["citation_ids"]
+                .as_array()
+                .context("citation_ids must be an array")?;
+            ensure!(
+                !references.is_empty() && references.len() <= 30,
+                "Each requirement needs 1–30 citations"
+            );
+            let mut seen = HashSet::new();
+            for reference in references {
+                let reference = reference.as_str().context("Citation id must be a string")?;
+                ensure!(
+                    citation_ids.contains(reference) && seen.insert(reference),
+                    "Missing or duplicate citation reference: {reference}"
+                );
+            }
+            if op == "manual" {
+                require_null(
+                    rule,
+                    &[
+                        "field",
+                        "value",
+                        "values",
+                        "min",
+                        "max",
+                        "left",
+                        "right",
+                        "relation",
+                        "days",
+                        "population_basis",
+                        "reference_date",
+                    ],
+                )?;
+                text(&rule["note"], "manual note", 1, 5000)?;
+                return Ok(());
+            }
+            if op == "compare" {
+                require_null(rule, &["field", "value", "values", "min", "max", "days"])?;
+                enumeration(&rule["relation"], &["lte", "gte"], "relation")?;
+                for side in ["left", "right"] {
+                    let terms = rule[side]
                         .as_array()
-                        .context("values must be an array")?;
+                        .with_context(|| format!("{side} must be a term array"))?;
                     ensure!(
-                        !values.is_empty() && values.len() <= 100,
-                        "one_of requires 1–100 values"
+                        !terms.is_empty() && terms.len() <= 20,
+                        "Comparison sides require 1–20 terms"
                     );
-                    let mut unique = HashSet::new();
-                    for value in values {
+                    let mut seen = HashSet::new();
+                    for term in terms {
+                        closed_object(term, &["field", "factor"], "Comparison term")?;
+                        let field = term["field"]
+                            .as_str()
+                            .context("Term field must be string")?;
                         ensure!(
-                            valid_value(value, definition),
-                            "one_of value does not match its field type"
+                            definition(field)?["type"] == "number",
+                            "Comparison terms must be numeric fields"
                         );
-                        ensure!(unique.insert(value.to_string()), "Duplicate one_of value");
+                        ensure!(seen.insert(field), "Duplicate comparison field in one side");
+                        let factor = numeric(&term["factor"], "factor", 0.0, 1e6)?;
+                        ensure!(factor > 0.0, "Term factor must be positive");
                     }
                 }
-                "range" => {
-                    require_null(rule, &["value", "values", "days"])?;
-                    ensure!(
-                        definition["type"] == "number",
-                        "range requires a numeric field"
-                    );
-                    ensure!(
-                        !rule["min"].is_null() || !rule["max"].is_null(),
-                        "range needs at least one bound"
-                    );
-                    for bound in ["min", "max"] {
-                        if !rule[bound].is_null() {
-                            numeric(&rule[bound], bound, 0.0, 1e15)?;
+            } else {
+                require_null(rule, &["left", "right", "relation"])?;
+                let field = rule["field"]
+                    .as_str()
+                    .context("field must be a supported field string")?;
+                let definition = definition(field)?;
+                match op {
+                    "equals" => {
+                        require_null(rule, &["values", "min", "max", "days"])?;
+                        ensure!(
+                            valid_value(&rule["value"], definition),
+                            "equals value does not match its field type"
+                        );
+                    }
+                    "one_of" => {
+                        require_null(rule, &["value", "min", "max", "days"])?;
+                        let values = rule["values"]
+                            .as_array()
+                            .context("values must be an array")?;
+                        ensure!(
+                            !values.is_empty() && values.len() <= 100,
+                            "one_of requires 1–100 values"
+                        );
+                        let mut unique = HashSet::new();
+                        for value in values {
+                            ensure!(
+                                valid_value(value, definition),
+                                "one_of value does not match its field type"
+                            );
+                            ensure!(unique.insert(value.to_string()), "Duplicate one_of value");
                         }
                     }
-                    if let (Some(min), Some(max)) = (rule["min"].as_f64(), rule["max"].as_f64()) {
-                        ensure!(min <= max, "range min exceeds max");
+                    "range" => {
+                        require_null(rule, &["value", "values", "days"])?;
+                        ensure!(
+                            definition["type"] == "number",
+                            "range requires a numeric field"
+                        );
+                        ensure!(
+                            !rule["min"].is_null() || !rule["max"].is_null(),
+                            "range needs at least one bound"
+                        );
+                        for bound in ["min", "max"] {
+                            if !rule[bound].is_null() {
+                                numeric(&rule[bound], bound, 0.0, 1e15)?;
+                            }
+                        }
+                        if let (Some(min), Some(max)) = (rule["min"].as_f64(), rule["max"].as_f64())
+                        {
+                            ensure!(min <= max, "range min exceeds max");
+                        }
                     }
+                    "min_days" => {
+                        require_null(rule, &["value", "values", "min", "max"])?;
+                        ensure!(
+                            definition["type"] == "date",
+                            "min_days requires a date field"
+                        );
+                        ensure!(
+                            rule["days"].as_u64().is_some_and(|n| n <= 36_600),
+                            "days must be an integer between 0 and 36600"
+                        );
+                    }
+                    _ => unreachable!(),
                 }
-                "min_days" => {
-                    require_null(rule, &["value", "values", "min", "max"])?;
-                    ensure!(
-                        definition["type"] == "date",
-                        "min_days requires a date field"
-                    );
-                    ensure!(
-                        rule["days"].as_u64().is_some_and(|n| n <= 36_600),
-                        "days must be an integer between 0 and 36600"
-                    );
-                }
-                _ => unreachable!(),
             }
-        }
-        let used_fields = rule_fields(rule);
-        let inferred_scope = used_fields
-            .iter()
-            .map(|field| {
-                let scope = fields()[*field]["scope"].as_str().unwrap_or("");
-                SCOPES.iter().position(|item| *item == scope).unwrap_or(0)
-            })
-            .max()
-            .unwrap_or(0);
-        ensure!(
-            scope == SCOPES[inferred_scope],
-            "Rule scope must match its field scope (or most specific comparison scope)"
-        );
-        ensure!(
-            scope == "municipality" || rule["blocker"] != "applicant",
-            "Project/application evidence cannot exclude an applicant globally"
-        );
-        ensure!(
-            used_fields.contains(&"population") || rule["population_basis"].is_null(),
-            "population_basis only applies to population rules"
-        );
+            let used_fields = rule_fields(rule);
+            let inferred_scope = used_fields
+                .iter()
+                .map(|field| {
+                    let scope = fields()[*field]["scope"].as_str().unwrap_or("");
+                    SCOPES.iter().position(|item| *item == scope).unwrap_or(0)
+                })
+                .max()
+                .unwrap_or(0);
+            ensure!(
+                scope == SCOPES[inferred_scope],
+                "Rule scope must match its field scope (or most specific comparison scope)"
+            );
+            ensure!(
+                scope == "municipality" || rule["blocker"] != "applicant",
+                "Project/application evidence cannot exclude an applicant globally"
+            );
+            ensure!(
+                used_fields.contains(&"population") || rule["population_basis"].is_null(),
+                "population_basis only applies to population rules"
+            );
+            Ok(())
+        };
+        validate_rule().with_context(|| format!("Requirement {} ({})", index + 1, rule["id"]))?;
     }
     Ok(())
 }
 
-fn object_schema(properties: Value) -> Value {
-    let required: Vec<_> = properties.as_object().unwrap().keys().cloned().collect();
-    json!({"type":"object","properties":properties,"required":required,"additionalProperties":false})
-}
-fn nullable_string() -> Value {
-    json!({"type":["string","null"]})
-}
-/// JSON Schema body for a strict OpenRouter response_format.json_schema.schema.
-/// All object properties are required; unused operator arguments must be null.
+/// Compact model contract; legacy 18-key rules remain supported only for stored data.
 pub fn extraction_schema() -> Value {
-    let field_names: Vec<_> = fields().as_object().unwrap().keys().cloned().collect();
-    let mut nullable_fields: Vec<Value> = field_names.iter().map(|x| json!(x)).collect();
-    nullable_fields.push(Value::Null);
-    let scalar = json!({"type":["string","number","boolean"]});
-    let term = object_schema(json!({
-        "field":{"type":"string","enum":field_names}, "factor":{"type":"number","exclusiveMinimum":0,"maximum":1e6}
-    }));
-    let rule = object_schema(json!({
-        "id":{"type":"string","minLength":1,"maxLength":160},
-        "label":{"type":"string","minLength":1,"maxLength":1000},
-        "op":{"type":"string","enum":OPS},
-        "field":{"type":["string","null"],"enum":nullable_fields},
-        "scope":{"type":"string","enum":SCOPES},
-        "blocker":{"type":"string","enum":["applicant","project","application"]},
-        "value":{"type":["string","number","boolean","null"]},
-        "values":{"type":["array","null"],"items":scalar,"minItems":1,"maxItems":100},
-        "min":{"type":["number","null"],"minimum":0,"maximum":1e15},
-        "max":{"type":["number","null"],"minimum":0,"maximum":1e15},
-        "left":{"type":["array","null"],"items":term,"minItems":1,"maxItems":20},
-        "right":{"type":["array","null"],"items":term,"minItems":1,"maxItems":20},
-        "relation":{"type":["string","null"],"enum":["lte","gte",null]},
-        "days":{"type":["integer","null"],"minimum":0,"maximum":36600},
-        "citation_ids":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":30},
-        "note":nullable_string(),
-        "population_basis":{"type":["string","null"],"enum":["estimate","resident","legal",null]},
-        "reference_date":{"type":["string","null"],"description":"Exact required reference date, YYYY-MM-DD. Do not substitute a different year's population estimate."}
-    }));
-    let citation = object_schema(json!({
-        "id":{"type":"string","minLength":1,"maxLength":160},
-        "source_url":{"type":"string","description":"Copy one of the supplied official source URLs exactly."},
-        "locator":{"type":"string","minLength":1,"maxLength":1000},
-        "quote":{"type":"string","minLength":8,"maxLength":10000,"description":"A model-reported source quotation; never invent a quotation."}
-    }));
-    object_schema(json!({
-        "title":{"type":"string","minLength":1,"maxLength":500},
-        "summary":{"type":"string","minLength":1,"maxLength":10000},
-        "status":{"type":"string","enum":["open","forthcoming","closed","unknown"]},
-        "opens_on":{"type":["string","null"],"description":"Opening date YYYY-MM-DD, or null when not established."},
-        "closes_at":{"type":["string","null"],"description":"Exact RFC3339 deadline with timezone, or null. Never invent a time or timezone. An open call with a null deadline MUST set needs_review true and explain the missing deadline."},
-        "needs_review":{"type":"boolean","description":"True for incomplete or ambiguous rules, unreadable annexes, unconfirmed status, or missing deadline. These uncertainties must remain visible for review rather than being treated as definite exclusions or closures."},
-        "review_reasons":{"type":"array","items":{"type":"string","minLength":1,"maxLength":3000},"maxItems":100},
-        "requirements":{"type":"array","items":rule,"maxItems":200},
-        "citations":{"type":"array","items":citation,"minItems":1,"maxItems":300}
-    }))
+    crate::contract::schema()
+}
+
+/// All genuine unresolved facts are visible in diagnostics, even when JSON is valid.
+pub fn extraction_review_reasons(value: &Value) -> Vec<String> {
+    let mut reasons: Vec<String> = value["review_reasons"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str().map(str::to_owned))
+        .collect();
+    if value["status"] == "unknown" {
+        reasons.push("Opening status is unknown".into());
+    }
+    if value["status"] != "closed" && value["closes_at"].is_null() {
+        reasons.push("Application deadline/timezone is not established".into());
+    }
+    for rule in value["requirements"].as_array().into_iter().flatten() {
+        if rule["op"] == "manual" {
+            reasons.push(format!(
+                "{}: {}",
+                rule["id"].as_str().unwrap_or("manual"),
+                rule["note"]
+                    .as_str()
+                    .unwrap_or("Condition requires manual checking")
+            ));
+        }
+        if rule["field"] == "population"
+            && (rule["population_basis"].is_null() || rule["reference_date"].is_null())
+        {
+            reasons.push(format!(
+                "{}: population basis/reference date is not established",
+                rule["id"].as_str().unwrap_or("population")
+            ));
+        }
+    }
+    reasons.sort();
+    reasons.dedup();
+    reasons
 }
 
 #[derive(Clone)]
@@ -620,15 +630,12 @@ fn resolve_evidence(
             "Population basis is unspecified; an estimate cannot prove an arbitrary demographic or legal criterion",
         );
     }
-    if field == "population"
-        && rule["population_basis"] == "legal"
-        && rule["reference_date"].is_null()
-    {
+    if field == "population" && rule["reference_date"].is_null() {
         return fact(
             "review_required",
             field,
             &records,
-            "Legal population requires an explicit reference date",
+            "Population requires an explicit reference date; an arbitrary year's value cannot establish the condition",
         );
     }
     let matching: Vec<_> = records
@@ -878,6 +885,19 @@ pub fn evaluate_for_call(
     call_id: Option<&str>,
     as_of: &str,
 ) -> Value {
+    let is_compact = extraction["schema_version"] == 2;
+    let normalized;
+    let extraction = if is_compact {
+        normalized = match crate::contract::to_legacy(extraction) {
+            Ok(value) => value,
+            Err(error) => {
+                return json!({"state":"invalid_extraction","visible":true,"needs_review":true,"reason":"Stored extraction does not satisfy the current contract; review the original source before matching","error":format!("{error:#}"),"review_reasons":[format!("{error:#}")],"results":[],"legal_clearance":false});
+            }
+        };
+        &normalized
+    } else {
+        extraction
+    };
     let sources: Vec<String> = extraction["citations"]
         .as_array()
         .into_iter()
@@ -887,8 +907,8 @@ pub fn evaluate_for_call(
     // Older stored/external extractions may omit the review flag for a missing
     // deadline. Validate every other invariant, then preserve them as visible
     // review cases below; never turn an absent deadline into perpetual openness.
-    if let Err(error) = validate_extraction_inner(extraction, &sources, false) {
-        return json!({"state":"invalid_extraction","visible":false,"error":error.to_string(),"results":[],"legal_clearance":false});
+    if let Err(error) = validate_extraction_inner(extraction, Some(&sources), false) {
+        return json!({"state":"invalid_extraction","visible":true,"needs_review":true,"reason":"Stored extraction does not satisfy the current contract; review the original source before matching","error":format!("{error:#}"),"review_reasons":[format!("{error:#}")],"results":[],"legal_clearance":false});
     }
     let Some(time) = instant(as_of) else {
         return json!({"state":"invalid_context","visible":false,"error":"as_of must be YYYY-MM-DD or RFC3339","results":[],"legal_clearance":false});
@@ -923,7 +943,7 @@ pub fn evaluate_for_call(
     // Extraction uncertainty applies to the purported rules and dates themselves.
     // Keep the raw failed-rule/closed-window details, but do not silently hide a
     // notice whose annexes, conditions, or deadline have not been established.
-    let state = if extraction["needs_review"] == true || missing_deadline {
+    let state = if extraction["needs_review"] == true || (!is_compact && missing_deadline) {
         "review_required"
     } else if window["state"] == "closed" {
         "closed"
@@ -933,10 +953,34 @@ pub fn evaluate_for_call(
         "ineligible"
     } else if window["state"] == "forthcoming" {
         "forthcoming"
-    } else if all_pass && extraction["needs_review"] == false && window["state"] == "open" {
+    } else if all_pass && window["state"] == "open" {
         "screening_match"
     } else {
         "review_required"
+    };
+    if window["state"] == "unknown" {
+        review_reasons.push(window["reason"].clone());
+    }
+    for result in &results {
+        if !matches!(result["state"].as_str(), Some("pass" | "fail")) {
+            review_reasons.push(json!(format!(
+                "{}: {}",
+                result["label"].as_str().unwrap_or("Condition"),
+                result["reason"].as_str().unwrap_or("Unknown")
+            )));
+        }
+    }
+    let decision_reason = match state {
+        "excluded" => {
+            "Verified applicant facts conflict with an explicit cited applicant requirement"
+        }
+        "ineligible" => "Available project/application facts fail a cited requirement",
+        "closed" => "The documented application window is closed",
+        "screening_match" => {
+            "All extracted conditions match the available evidence; this is not legal clearance"
+        }
+        "forthcoming" => "The application window is not yet open",
+        _ => "Eligibility cannot be established from the available source or applicant facts",
     };
     let visible = !matches!(state, "closed" | "excluded" | "ineligible");
     let mut counts = Map::new();
@@ -946,7 +990,7 @@ pub fn evaluate_for_call(
         counts.insert(state.to_string(), json!(number));
     }
     json!({
-        "state":state,"visible":visible,"window":window,"results":results,"counts":counts,
+        "state":state,"reason":decision_reason,"visible":visible,"window":window,"results":results,"counts":counts,
         "municipality_id":id,"project_id":project_id,"call_id":call_id,"as_of":as_of,
         "needs_review":matches!(state, "review_required" | "forthcoming"), "review_reasons":review_reasons,
         "legal_clearance":false,"citation_verification":"model_reported_unverified",
@@ -1488,7 +1532,8 @@ mod tests {
         ] {
             let output = evaluate(&invalid, &municipality(), &[], None, "2026-10-06");
             assert_eq!(output["state"], "invalid_extraction");
-            assert_eq!(output["visible"], false);
+            assert_eq!(output["visible"], true);
+            assert_eq!(output["needs_review"], true);
         }
         let call = extraction(equality("entity.kind", json!("municipality")));
         assert_eq!(
