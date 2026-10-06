@@ -171,7 +171,7 @@ fn rule_fields(rule: &Value) -> Vec<&str> {
 /// Enforces the schema *and* operator-specific types, references, dates, and scope.
 /// `allowed_sources` must come from the trusted call/configuration, not the model.
 pub fn validate_extraction(value: &Value, allowed_sources: &[String]) -> Result<()> {
-    if value["schema_version"] == 2 {
+    if matches!(value["schema_version"].as_u64(), Some(2 | 3)) {
         let normalized = crate::contract::to_legacy(value)?;
         validate_extraction_inner(&normalized, Some(allowed_sources), false)
     } else {
@@ -182,7 +182,7 @@ pub fn validate_extraction(value: &Value, allowed_sources: &[String]) -> Result<
 /// Offline structural diagnosis only: does not authenticate citation destinations.
 /// Never use this to accept a live response or import recovered facts.
 pub fn validate_extraction_structure(value: &Value) -> Result<()> {
-    if value["schema_version"] == 2 {
+    if matches!(value["schema_version"].as_u64(), Some(2 | 3)) {
         validate_extraction_inner(&crate::contract::to_legacy(value)?, None, false)
     } else {
         validate_extraction_inner(value, None, true)
@@ -474,6 +474,12 @@ pub fn extraction_review_reasons(value: &Value) -> Vec<String> {
         .flatten()
         .filter_map(|v| v.as_str().map(str::to_owned))
         .collect();
+    if value["requirements"]
+        .as_array()
+        .is_some_and(|rules| rules.is_empty())
+    {
+        reasons.push("No requirements were extracted from the supplied sources".into());
+    }
     if value["status"] == "unknown" {
         reasons.push("Opening status is unknown".into());
     }
@@ -885,7 +891,7 @@ pub fn evaluate_for_call(
     call_id: Option<&str>,
     as_of: &str,
 ) -> Value {
-    let is_compact = extraction["schema_version"] == 2;
+    let is_compact = matches!(extraction["schema_version"].as_u64(), Some(2 | 3));
     let normalized;
     let extraction = if is_compact {
         normalized = match crate::contract::to_legacy(extraction) {

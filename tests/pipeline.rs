@@ -57,7 +57,8 @@ impl Mock {
                     let mut extraction: Value =
                         serde_json::from_str(include_str!("fixtures/extraction.json")).unwrap();
                     extraction.as_object_mut().unwrap().remove("needs_review");
-                    extraction["schema_version"] = json!(2);
+                    extraction.as_object_mut().unwrap().remove("review_reasons");
+                    extraction["schema_version"] = json!(3);
                     for rule in extraction["requirements"].as_array_mut().unwrap() {
                         for key in [
                             "scope",
@@ -83,13 +84,23 @@ impl Mock {
                     let mode = m.lock().unwrap().clone();
                     if mode == "estonian_startup" {
                         extraction.as_object_mut().unwrap().remove("needs_review");
-                        extraction["schema_version"] = json!(2);
+                        extraction.as_object_mut().unwrap().remove("review_reasons");
+                        extraction["schema_version"] = json!(3);
                         extraction["closes_at"] = Value::Null;
                         extraction["requirements"] = json!([
                             {"id":"country","label":"Estonian applicant","op":"equals","field":"entity.country","value":"EE","citation_ids":["c1"]},
                             {"id":"kind","label":"Startup applicant","op":"equals","field":"entity.kind","value":"startup","citation_ids":["c1"]},
                             {"id":"project","label":"Unrelated technical requirement","op":"manual","note":"Technical certificate required","citation_ids":["c1"]}
                         ]);
+                    }
+                    if mode == "individual" {
+                        extraction["closes_at"] = Value::Null;
+                        extraction["requirements"] = json!([
+                            {"id":"kind","label":"Individual applicant","op":"equals","field":"entity.kind","value":"individual","citation_ids":["c1"]},
+                            {"id":"course","label":"Degree course","op":"manual","note":"Check the specified degree courses","citation_ids":["c1"]}
+                        ]);
+                        extraction["citations"][0]["quote"] =
+                            json!("Students in the specified degree courses may apply.");
                     }
                     let mut response = json!({"id":"gen-mock","model":MODEL,"provider":"OpenAI","choices":[{"finish_reason":"stop","message":{"content":extraction.to_string()}}],"usage":{"prompt_tokens":1000,"completion_tokens":200,"completion_tokens_details":{"reasoning_tokens":150},"cost":0.002}});
                     if mode == "unknown_cost" {
@@ -236,6 +247,20 @@ fn limit_cache_native_bytes_and_amendment_context() {
     assert_eq!(request["reasoning"]["effort"], "max");
     assert_eq!(request["provider"]["allow_fallbacks"], false);
     assert_eq!(request["response_format"]["json_schema"]["strict"], true);
+    let instruction = request["messages"][0]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .split("INPUT DATA:")
+        .next()
+        .unwrap();
+    assert!(instruction.contains("Do your best"));
+    assert!(instruction.split_whitespace().count() < 140);
+    assert!(!instruction.contains("review_reasons"));
+    assert!(
+        request["response_format"]["json_schema"]["schema"]["properties"]
+            .get("review_reasons")
+            .is_none()
+    );
     let metadata: Value = serde_json::from_str(
         request["messages"][0]["content"][0]["text"]
             .as_str()
@@ -581,50 +606,61 @@ fn removed_attachment_forces_review_and_original_cache_self_repairs() {
 
 #[test]
 fn valid_incompatible_call_is_accepted_as_extraction_not_model_rejected() {
-    let mock = Mock::new();
-    *mock.response_mode.lock().unwrap() = "estonian_startup".into();
-    let temp = TempDir::new().unwrap();
-    let mut store = db(&temp);
-    let summary = pipeline::run(
-        &mut store,
-        &http(),
-        Some(&mock.model()),
-        vec![mock.notice("startup", &[])],
-        &options(&temp, 1),
-    )
-    .unwrap();
-    assert_eq!(
-        (
-            summary.accepted,
-            summary.needs_review,
-            summary.failed,
-            summary.calls
-        ),
-        (1, 0, 0, 1)
-    );
-    let notices = store.latest_notices().unwrap();
-    assert_eq!(notices[0]["state"], "screened");
-    assert!(notices[0]["error"].is_null());
-    let municipality =
-        json!({"istatCode":"081001","region":"Sicilia","registryReferenceDate":"2026-10-06"});
-    let result = funding_rust::engine::evaluate(
-        &notices[0]["extraction"],
-        &municipality,
-        &[],
-        None,
-        "2026-10-06T12:00:00Z",
-    );
-    assert_eq!(result["state"], "excluded");
-    assert_eq!(result["window"]["state"], "unknown");
-    assert_eq!(result["results"][2]["state"], "review_required");
-    let raw: String = store
-        .conn
-        .query_row("SELECT response FROM attempts", [], |r| r.get(0))
+    for mode in ["estonian_startup", "individual"] {
+        let mock = Mock::new();
+        *mock.response_mode.lock().unwrap() = mode.into();
+        let temp = TempDir::new().unwrap();
+        let mut store = db(&temp);
+        let summary = pipeline::run(
+            &mut store,
+            &http(),
+            Some(&mock.model()),
+            vec![mock.notice("startup", &[])],
+            &options(&temp, 1),
+        )
         .unwrap();
-    let raw: Value = serde_json::from_str(&raw).unwrap();
-    let content: Value =
-        serde_json::from_str(raw["choices"][0]["message"]["content"].as_str().unwrap()).unwrap();
-    assert_eq!(content, notices[0]["extraction"]);
+        assert_eq!(
+            (
+                summary.accepted,
+                summary.needs_review,
+                summary.failed,
+                summary.calls
+            ),
+            (1, 0, 0, 1)
+        );
+        let notices = store.latest_notices().unwrap();
+        assert_eq!(notices[0]["state"], "screened");
+        assert!(notices[0]["error"].is_null());
+        let municipality =
+            json!({"istatCode":"081001","region":"Sicilia","registryReferenceDate":"2026-10-06"});
+        let result = funding_rust::engine::evaluate(
+            &notices[0]["extraction"],
+            &municipality,
+            &[],
+            None,
+            "2026-10-06T12:00:00Z",
+        );
+        assert_eq!(result["state"], "excluded");
+        assert_eq!(result["window"]["state"], "unknown");
+        assert_eq!(
+            result["results"].as_array().unwrap().last().unwrap()["state"],
+            "review_required"
+        );
+        let raw: String = store
+            .conn
+            .query_row("SELECT response FROM attempts", [], |r| r.get(0))
+            .unwrap();
+        let raw: Value = serde_json::from_str(&raw).unwrap();
+        let content: Value =
+            serde_json::from_str(raw["choices"][0]["message"]["content"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(content["schema_version"], 3);
+        assert!(content.get("review_reasons").is_none());
+        let mut expected_stored = content.clone();
+        expected_stored["schema_version"] = json!(2);
+        expected_stored["review_reasons"] = json!([]);
+        assert_eq!(expected_stored, notices[0]["extraction"]);
+    }
 }
 
 #[test]

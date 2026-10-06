@@ -18,6 +18,11 @@ fn extraction(requirements: Vec<Value>) -> Value {
         "citations":[{"id":"c1","source_url":SOURCE,"locator":"Eligibility section",
         "quote":"Applicants must be startups registered in Estonia."}]})
 }
+fn facts(mut extraction: Value) -> Value {
+    extraction["schema_version"] = json!(3);
+    extraction.as_object_mut().unwrap().remove("review_reasons");
+    extraction
+}
 fn evaluate(extraction: &Value) -> Value {
     engine::evaluate_for_call(
         extraction,
@@ -203,7 +208,7 @@ fn compact_operators_and_precise_manual_diagnostics_remain_supported() {
 }
 #[test]
 fn malformed_or_truncated_provider_output_is_not_a_genuine_unknown_fact() {
-    let mut response = json!({"model":model::MODEL,"choices":[{"finish_reason":"stop","message":{"content":startup().to_string()}}]});
+    let mut response = json!({"model":model::MODEL,"choices":[{"finish_reason":"stop","message":{"content":facts(startup()).to_string()}}]});
     assert!(model::parse_response(&response, &sources()).is_ok());
     response["choices"][0]["message"]["content"] = json!("{invalid");
     assert!(
@@ -312,7 +317,7 @@ fn identifier_schema_declares_the_same_ascii_syntax_as_validation() {
     }
 }
 #[test]
-fn new_responses_require_v2_while_replay_can_read_unchanged_legacy() {
+fn new_responses_require_v3_while_replay_can_read_unchanged_legacy() {
     let legacy: Value = serde_json::from_str(include_str!("fixtures/extraction.json")).unwrap();
     let response = json!({"model":model::MODEL,"choices":[{"finish_reason":"stop","message":{"content":legacy.to_string()}}]});
     let sources = vec!["https://example.gov/call.pdf".into()];
@@ -320,6 +325,13 @@ fn new_responses_require_v2_while_replay_can_read_unchanged_legacy() {
     assert_eq!(
         model::parse_saved_response(&response, &sources).unwrap(),
         legacy
+    );
+    let compact = startup();
+    let response = json!({"model":model::MODEL,"choices":[{"finish_reason":"stop","message":{"content":compact.to_string()}}]});
+    assert!(model::parse_response(&response, &self::sources()).is_err());
+    assert_eq!(
+        model::parse_saved_response(&response, &self::sources()).unwrap(),
+        compact
     );
 }
 #[test]
@@ -335,5 +347,83 @@ fn duplicate_keys_cannot_erase_eligibility_uncertainty_live_or_during_replay() {
     ] {
         let error = parsed.unwrap_err();
         assert!(format!("{error:#}").contains("Duplicate JSON key: review_reasons"));
+    }
+}
+
+#[test]
+fn individual_requirement_excludes_comune_despite_unrelated_course_detail() {
+    let mut call = facts(extraction(vec![
+        condition("applicant", "entity.kind", json!("individual")),
+        json!({"id":"course","label":"Corso di laurea","op":"manual",
+            "note":"Verificare il corso di laurea richiesto.","citation_ids":["c1"]}),
+    ]));
+    call["citations"][0]["quote"] =
+        json!("Students enrolled in one of the specified degree courses may apply.");
+    call["closes_at"] = Value::Null;
+    engine::validate_extraction(&call, &sources()).unwrap();
+    let result = evaluate(&call);
+    assert_eq!(result["state"], "excluded");
+    assert_eq!(result["results"][0]["state"], "fail");
+    assert_eq!(result["results"][1]["state"], "review_required");
+    assert_eq!(result["legal_clearance"], false);
+    // A historical model-authored global review remains historical, not repaired.
+    let mut historical = call.clone();
+    historical["schema_version"] = json!(2);
+    historical["review_reasons"] = json!(["Degree-course detail needs checking"]);
+    let preserved = historical.clone();
+    assert_eq!(evaluate(&historical)["state"], "review_required");
+    assert_eq!(historical, preserved);
+}
+
+#[test]
+fn unknown_applicant_and_empty_requirements_do_not_become_a_match() {
+    for requirements in [
+        vec![],
+        vec![json!({"id":"applicant","label":"Applicant type",
+        "op":"manual","note":"Applicant type is unclear in the supplied text.","citation_ids":["c1"]})],
+    ] {
+        let call = facts(extraction(requirements));
+        engine::validate_extraction(&call, &sources()).unwrap();
+        let result = evaluate(&call);
+        assert_eq!(result["state"], "review_required");
+        assert_eq!(result["visible"], true);
+        assert_eq!(result["legal_clearance"], false);
+    }
+}
+
+#[test]
+fn missing_nullable_values_are_valid_facts_and_stay_unknown() {
+    let mut call = facts(extraction(vec![
+        json!({"id":"population","label":"Population",
+        "op":"range","field":"population","min":null,"max":5000,
+        "population_basis":null,"reference_date":null,"citation_ids":["c1"]}),
+    ]));
+    call["opens_on"] = Value::Null;
+    call["closes_at"] = Value::Null;
+    call["status"] = json!("unknown");
+    let response = json!({"model":model::MODEL,"choices":[{"finish_reason":"stop","message":{"content":call.to_string()}}]});
+    assert_eq!(model::parse_response(&response, &sources()).unwrap(), call);
+    assert_eq!(evaluate(&call)["state"], "review_required");
+    assert_eq!(evaluate(&call)["legal_clearance"], false);
+    let schema = engine::extraction_schema();
+    assert_eq!(
+        schema["properties"]["opens_on"]["type"],
+        json!(["string", "null"])
+    );
+    assert_eq!(
+        schema["properties"]["closes_at"]["type"],
+        json!(["string", "null"])
+    );
+}
+
+#[test]
+fn factual_contract_has_no_model_global_review_verdict() {
+    let schema = engine::extraction_schema();
+    assert_eq!(schema["properties"]["schema_version"]["enum"], json!([3]));
+    for key in ["needs_review", "review_reasons", "eligibility"] {
+        assert!(schema["properties"].get(key).is_none());
+        let mut call = facts(startup());
+        call[key] = json!([]);
+        assert!(engine::validate_extraction(&call, &sources()).is_err());
     }
 }

@@ -39,9 +39,39 @@ fn exact_keys(value: &Value, keys: &[&str], name: &str) -> Result<()> {
     Ok(())
 }
 
+/// The model returns facts only. Keep the established v2 storage shape so the
+/// pipeline can attach its own input failures without changing old raw responses.
+pub fn to_stored(value: &Value) -> Result<Value> {
+    let keys: Vec<_> = TOP_KEYS
+        .iter()
+        .copied()
+        .filter(|key| *key != "review_reasons")
+        .collect();
+    exact_keys(value, &keys, "Extraction v3")?;
+    ensure!(value["schema_version"] == 3, "Unsupported schema_version");
+    let rules = value["requirements"]
+        .as_array()
+        .context("requirements must be an array")?;
+    let mut stored = value.clone();
+    stored["schema_version"] = json!(2);
+    stored["review_reasons"] = if rules.is_empty() {
+        json!(["No requirements were extracted from the supplied sources"])
+    } else {
+        json!([])
+    };
+    Ok(stored)
+}
+
 /// Translate only a structurally complete v2 extraction; never repair or infer source facts.
 /// Scope and exclusion level come from the trusted field catalogue, never the model.
 pub fn to_legacy(value: &Value) -> Result<Value> {
+    let stored;
+    let value = if value["schema_version"] == 3 {
+        stored = to_stored(value)?;
+        &stored
+    } else {
+        value
+    };
     exact_keys(value, TOP_KEYS, "Extraction v2")?;
     ensure!(value["schema_version"] == 2, "Unsupported schema_version");
     let rules = value["requirements"]
@@ -237,12 +267,11 @@ pub fn schema() -> Value {
     let citation = object(json!({"id":identifier_schema(),
         "source_url":{"type":"string","description":"Exactly one supplied current source URL."},
         "locator":string(1,1000),"quote":string(8,10000)}));
-    object(json!({"schema_version":{"type":"integer","enum":[2]},
+    object(json!({"schema_version":{"type":"integer","enum":[3]},
         "title":string(1,500),"summary":string(1,10000),
         "status":{"type":"string","enum":["open","forthcoming","closed","unknown"]},
         "opens_on":{"type":["string","null"],"description":"YYYY-MM-DD; null if unknown."},
         "closes_at":{"type":["string","null"],"description":"Application deadline as RFC3339 with explicit timezone; null if unknown. Never invent time/timezone."},
-        "review_reasons":{"type":"array","items":string(1,3000),"maxItems":100,"description":"Source/eligibility uncertainty that could invalidate otherwise definite conditions: missing coverage, unreadable annexes, conflicting terms or alternative eligibility routes. Unknown status/deadline or an unrelated manual project condition do not belong here; they are already represented in their own fields."},
         "requirements":{"type":"array","items":{"anyOf":variants},"maxItems":200},
         "citations":{"type":"array","items":citation,"minItems":1,"maxItems":300}}))
 }
