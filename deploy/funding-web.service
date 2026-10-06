@@ -1,0 +1,19 @@
+# Example local-only UI. Put authenticated HTTPS in front before remote access.
+[Unit]
+Description=Funding read-only Rust UI
+
+[Service]
+Type=simple
+User=funding
+WorkingDirectory=/opt/funding
+ExecStart=/opt/funding/funding-rust --db /var/lib/funding/funding.sqlite serve --bind 127.0.0.1:8080
+Restart=on-failure
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/funding
+
+[Install]
+WantedBy=multi-user.target

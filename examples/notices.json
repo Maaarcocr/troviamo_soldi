@@ -1,0 +1,15 @@
+[
+  {
+    "id": "manual:replace-with-source-id",
+    "title": "Replace with an official notice title",
+    "source_url": "https://www.regione.sicilia.it/replace-with-official-notice",
+    "source_text": null,
+    "documents": [
+      {
+        "url": "https://www.regione.sicilia.it/replace-with-original.pdf",
+        "filename": "original.pdf",
+        "mime_type": "application/pdf"
+      }
+    ]
+  }
+]

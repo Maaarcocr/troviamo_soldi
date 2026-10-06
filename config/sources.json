@@ -1,0 +1,62 @@
+{
+  "coverage_note": "Bounded source registry, not all funding accessible to Sicilian municipalities. Notices/articles are not necessarily unique grants. Eligibility, deadlines, amendments and invitations need evidence extraction; unknowns must remain visible. National sources require added, verified feeds. Last audited shapes: 2026-10-06.",
+  "sources": [
+    {
+      "kind": "eu_sedia",
+      "enabled": true,
+      "page_size": 100,
+      "max_pages": 1000,
+      "coverage_note": "Official SEDIA current index only, English, types 1/2/8, source-marked open/forthcoming. Excludes procurement and stale CENTRICITY records. Metadata status does not prove a future application deadline or municipal eligibility. Downloads are limited to ec.europa.eu, commission.europa.eu and eur-lex.europa.eu (including their subdomains); external cascade sites are not crawled."
+    },
+    {
+      "kind": "euroinfosicilia",
+      "enabled": true,
+      "categories": [
+        321,
+        322,
+        340,
+        341,
+        372,
+        332,
+        327,
+        330,
+        1513
+      ],
+      "page_size": 100,
+      "max_pages": 1000,
+      "fetch_detail_pages": true,
+      "detail_delay_ms": 100,
+      "coverage_note": "Audited Bandi category union, including closed notices, results and amendments so stale/missing status labels cannot hide opportunities. HTML article attachments are fetched because they are absent from WP content. Not all Regione Sicilia departments, old archives or national ministries; linked landing pages and ZIP contents are not recursively crawled."
+    },
+    {
+      "kind": "manual_json",
+      "id": "national_verified_additions",
+      "enabled": false,
+      "allowed_hosts": [
+        "sport.governo.it",
+        "interno.gov.it",
+        "integrazionemigranti.gov.it"
+      ],
+      "notices": [],
+      "coverage_note": "Disabled template. Enable and provide notices inline, or replace notices with path (local JSON file) or url (official HTTPS JSON feed). Feed schema is an array, or {notices: [...]}; each entry has id, title, source_url, optional source_text, and documents [{url, optional filename, optional mime_type}]. Explicitly verify and extend allowed_hosts when adding ministries. Source and document links must use HTTPS; no generic scraping or national completeness is implied."
+    }
+  ],
+  "allowed_hosts": [
+    "api.tech.ec.europa.eu",
+    "ec.europa.eu",
+    "*.ec.europa.eu",
+    "commission.europa.eu",
+    "*.commission.europa.eu",
+    "eur-lex.europa.eu",
+    "euroinfosicilia.it",
+    "*.euroinfosicilia.it",
+    "regione.sicilia.it",
+    "*.regione.sicilia.it",
+    "sport.governo.it",
+    "*.sport.governo.it",
+    "interno.gov.it",
+    "*.interno.gov.it",
+    "integrazionemigranti.gov.it",
+    "*.integrazionemigranti.gov.it"
+  ]
+}

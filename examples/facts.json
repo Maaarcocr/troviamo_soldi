@@ -1,0 +1,19 @@
+{
+  "municipalityId": "088001",
+  "projects": [{"id":"school","name":"Esempio progetto scuola","description":"Sostituire con il progetto effettivo"}],
+  "evidence": [
+    {
+      "id":"design-example",
+      "municipalityId":"088001",
+      "projectId":"school",
+      "callId":null,
+      "field":"project.verifiedDesign",
+      "value":false,
+      "observedAt":"2026-10-06",
+      "validUntil":null,
+      "provenance":"user_declared",
+      "source":{"title":"ESEMPIO: sostituire con fonte reale","url":"","locator":""},
+      "note":"Esempio dimostrativo, non un fatto sul Comune. Modificare prima di importare."
+    }
+  ]
+}

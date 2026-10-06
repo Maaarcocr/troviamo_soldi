@@ -1,0 +1,41 @@
+{
+  "title": "Example municipal infrastructure call",
+  "summary": "Illustrative mocked extraction for local integration tests only.",
+  "status": "open",
+  "opens_on": "2026-01-01",
+  "closes_at": "2026-12-31T12:00:00+01:00",
+  "needs_review": false,
+  "review_reasons": [],
+  "requirements": [
+    {
+      "id": "applicant-kind",
+      "label": "Applicant must be a municipality",
+      "op": "equals",
+      "field": "entity.kind",
+      "scope": "municipality",
+      "blocker": "applicant",
+      "value": "municipality",
+      "values": null,
+      "min": null,
+      "max": null,
+      "left": null,
+      "right": null,
+      "relation": null,
+      "days": null,
+      "citation_ids": [
+        "c1"
+      ],
+      "note": null,
+      "population_basis": null,
+      "reference_date": null
+    }
+  ],
+  "citations": [
+    {
+      "id": "c1",
+      "source_url": "https://example.gov/call.pdf",
+      "locator": "Article 3, page 4",
+      "quote": "Eligible applicants are municipalities."
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+# Example only. No timer is installed by the application.
+[Unit]
+Description=Daily funding discovery
+
+[Timer]
+OnCalendar=*-*-* 06:00:00 UTC
+Persistent=true
+RandomizedDelaySec=300
+Unit=funding-daily.service
+
+[Install]
+WantedBy=timers.target

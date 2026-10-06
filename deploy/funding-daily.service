@@ -1,0 +1,18 @@
+# Example only. Replace user, paths, limit and output allowance before installing.
+[Unit]
+Description=Collect changed funding notices with a bounded Luna pilot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=funding
+WorkingDirectory=/opt/funding
+EnvironmentFile=/etc/funding/openrouter.env
+ExecStart=/opt/funding/funding-rust --db /var/lib/funding/funding.sqlite daily --sources /opt/funding/config/sources.json --cache /var/lib/funding/files --limit 5 --allow-paid
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/funding

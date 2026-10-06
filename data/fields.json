@@ -1,0 +1,306 @@
+{
+  "entity.kind": {
+    "label": "Tipo di ente",
+    "type": "string",
+    "scope": "municipality",
+    "readOnly": true
+  },
+  "entity.region": {
+    "label": "Regione",
+    "type": "string",
+    "scope": "municipality",
+    "readOnly": true
+  },
+  "entity.country": {
+    "label": "Paese",
+    "type": "string",
+    "scope": "municipality",
+    "readOnly": true
+  },
+  "entity.publicBody": {
+    "label": "Comune come ente pubblico",
+    "type": "boolean",
+    "scope": "municipality",
+    "readOnly": true
+  },
+  "population": {
+    "label": "Popolazione residente",
+    "type": "number",
+    "integer": true,
+    "scope": "municipality",
+    "help": "Indica data e fonte ISTAT; nessuna popolazione è presunta.",
+    "maxAgeDays": 730
+  },
+  "financial.currentStatus": {
+    "label": "Situazione finanziaria attuale",
+    "type": "enum",
+    "scope": "municipality",
+    "options": [
+      {
+        "value": "ordinary",
+        "label": "Gestione ordinaria documentata"
+      },
+      {
+        "value": "dissesto",
+        "label": "Dissesto"
+      },
+      {
+        "value": "riequilibrio",
+        "label": "Riequilibrio pluriennale"
+      },
+      {
+        "value": "other",
+        "label": "Altra situazione da descrivere"
+      }
+    ],
+    "maxAgeDays": 90,
+    "help": "Usa un atto attuale. L’assenza da un elenco storico non prova la gestione ordinaria."
+  },
+  "financial.dissestoHistory": {
+    "label": "Presenza nell’elenco storico dei dissesti",
+    "type": "boolean",
+    "scope": "municipality",
+    "help": "Fatto storico: non stabilisce se il dissesto è ancora in corso."
+  },
+  "financial.riequilibrioHistory": {
+    "label": "Presenza nell’elenco storico dei riequilibri",
+    "type": "boolean",
+    "scope": "municipality",
+    "help": "Fatto storico distinto dall’attuale situazione finanziaria."
+  },
+  "financial.approvedBudget": {
+    "label": "Bilancio vigente approvato e documentato",
+    "type": "boolean",
+    "scope": "municipality",
+    "help": "",
+    "maxAgeDays": 180
+  },
+  "project.totalCost": {
+    "label": "Costo complessivo stimato (€)",
+    "type": "number",
+    "scope": "project",
+    "help": "Comprende anche le voci eventualmente non ammissibili. Non è il contributo richiesto.",
+    "maxAgeDays": 120
+  },
+  "project.publicOwnership": {
+    "label": "Bene o area di proprietà pubblica",
+    "type": "boolean",
+    "scope": "project",
+    "help": "",
+    "maxAgeDays": 180
+  },
+  "project.assetAvailable": {
+    "label": "Disponibilità giuridica del bene alla domanda",
+    "type": "boolean",
+    "scope": "project",
+    "help": "",
+    "maxAgeDays": 180
+  },
+  "project.verifiedDesign": {
+    "label": "PFTE o esecutivo approvato, verificato e validato",
+    "type": "boolean",
+    "scope": "project",
+    "help": "",
+    "maxAgeDays": 180
+  },
+  "project.worksProgramme": {
+    "label": "Programmazione triennale dei lavori",
+    "type": "enum",
+    "scope": "project",
+    "options": [
+      {
+        "value": "included",
+        "label": "Già inserito"
+      },
+      {
+        "value": "integration_started",
+        "label": "Integrazione avviata"
+      },
+      {
+        "value": "absent",
+        "label": "Non inserito / integrazione non avviata"
+      }
+    ],
+    "maxAgeDays": 180
+  },
+  "project.noSiteDispute": {
+    "label": "Assenza di contenzioso sul bene o sull’area",
+    "type": "boolean",
+    "scope": "project",
+    "help": "",
+    "maxAgeDays": 180
+  },
+  "project.financeCapacity": {
+    "label": "Capacità e sostenibilità finanziaria documentate",
+    "type": "boolean",
+    "scope": "project",
+    "help": "Comprende impegni, liquidità, costi non coperti e gestione futura. Da validare con il responsabile finanziario.",
+    "maxAgeDays": 180
+  },
+  "project.schoolResponsibility": {
+    "label": "Proprietà o responsabilità legale dell’edificio scolastico",
+    "type": "boolean",
+    "scope": "project",
+    "help": "",
+    "maxAgeDays": 180
+  },
+  "project.schoolRegistered": {
+    "label": "Edificio censito ARES e verifiche strutturali disponibili",
+    "type": "boolean",
+    "scope": "project",
+    "help": "",
+    "maxAgeDays": 180
+  },
+  "project.existingBuilding": {
+    "label": "Intervento su edificio pubblico esistente",
+    "type": "boolean",
+    "scope": "project",
+    "help": "",
+    "maxAgeDays": 180
+  },
+  "project.energyAudit": {
+    "label": "Diagnosi energetica e APE disponibili",
+    "type": "boolean",
+    "scope": "project",
+    "help": "",
+    "maxAgeDays": 180
+  },
+  "application.eligibleCost": {
+    "label": "Costi ammissibili per questo bando (€)",
+    "type": "number",
+    "scope": "application",
+    "help": "La definizione cambia per avviso. Non copiare automaticamente il costo complessivo.",
+    "maxAgeDays": 120
+  },
+  "application.requestedGrant": {
+    "label": "Contributo richiesto a questo bando (€)",
+    "type": "number",
+    "scope": "application",
+    "help": "",
+    "maxAgeDays": 120
+  },
+  "application.otherFunding": {
+    "label": "Altre coperture consentite (€)",
+    "type": "number",
+    "scope": "application",
+    "help": "Risorse comunali, ricavi e altre fonti ammesse e documentate. Non è necessariamente tutto a carico del Comune. Evita il doppio conteggio.",
+    "maxAgeDays": 120
+  },
+  "application.actualRevenue": {
+    "label": "Ricavi effettivi per il saldo (€)",
+    "type": "number",
+    "scope": "application",
+    "help": "Solo ricavi effettivi rilevanti secondo l’avviso. Se non sono ancora noti, lascia vuoto: il controllo a saldo rimane ignoto.",
+    "maxAgeDays": 120
+  },
+  "application.noDoubleFunding": {
+    "label": "Nessun doppio finanziamento della stessa spesa",
+    "type": "boolean",
+    "scope": "application",
+    "help": "",
+    "maxAgeDays": 180
+  },
+  "application.singleApplication": {
+    "label": "Una sola domanda e nessuna candidatura concorrente",
+    "type": "boolean",
+    "scope": "application",
+    "help": "",
+    "maxAgeDays": 180
+  },
+  "application.exclusiveEventRight": {
+    "label": "Diritto esclusivo di organizzare o realizzare l’evento",
+    "type": "boolean",
+    "scope": "application",
+    "help": "",
+    "maxAgeDays": 180
+  },
+  "application.eventCategory": {
+    "label": "Categoria dell’evento",
+    "type": "enum",
+    "scope": "application",
+    "options": [
+      {
+        "value": "international",
+        "label": "Internazionale"
+      },
+      {
+        "value": "national_women",
+        "label": "Nazionale femminile"
+      },
+      {
+        "value": "other",
+        "label": "Altra categoria"
+      }
+    ],
+    "maxAgeDays": 180
+  },
+  "application.recognizedTitle": {
+    "label": "Titolo assegnato e riconoscimento federazione / DSA / EPS",
+    "type": "boolean",
+    "scope": "application",
+    "help": "",
+    "maxAgeDays": 180
+  },
+  "application.eventStart": {
+    "label": "Data di inizio evento",
+    "type": "date",
+    "scope": "application",
+    "maxAgeDays": 180
+  },
+  "application.previousReporting": {
+    "label": "Rendicontazioni pregresse dovute regolarmente assolte",
+    "type": "boolean",
+    "scope": "application",
+    "help": "",
+    "maxAgeDays": 180
+  },
+  "application.consortiumBeneficiaries": {
+    "label": "Beneficiari indipendenti nel consorzio",
+    "type": "number",
+    "integer": true,
+    "scope": "application",
+    "maxAgeDays": 180
+  },
+  "application.eligibleCountries": {
+    "label": "Paesi ammissibili rappresentati",
+    "type": "number",
+    "integer": true,
+    "scope": "application",
+    "maxAgeDays": 180
+  },
+  "application.euMemberPresent": {
+    "label": "Almeno un partner di uno Stato membro UE",
+    "type": "boolean",
+    "scope": "application",
+    "help": "",
+    "maxAgeDays": 180
+  },
+  "application.pilotNeighbourhoods": {
+    "label": "Quartieri pilota in paesi diversi",
+    "type": "number",
+    "integer": true,
+    "scope": "application",
+    "maxAgeDays": 180
+  },
+  "application.genderPlan": {
+    "label": "Piano per la parità di genere conforme entro la firma",
+    "type": "boolean",
+    "scope": "application",
+    "help": "",
+    "maxAgeDays": 180
+  },
+  "application.participants": {
+    "label": "Partecipanti diretti",
+    "type": "number",
+    "integer": true,
+    "scope": "application",
+    "maxAgeDays": 180
+  },
+  "application.internationalGuests": {
+    "label": "Invitati internazionali",
+    "type": "number",
+    "integer": true,
+    "scope": "application",
+    "maxAgeDays": 180
+  }
+}
