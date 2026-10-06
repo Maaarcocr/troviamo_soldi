@@ -56,11 +56,41 @@ impl Mock {
                             .unwrap();
                     let mut extraction: Value =
                         serde_json::from_str(include_str!("fixtures/extraction.json")).unwrap();
+                    extraction.as_object_mut().unwrap().remove("needs_review");
+                    extraction["schema_version"] = json!(2);
+                    for rule in extraction["requirements"].as_array_mut().unwrap() {
+                        for key in [
+                            "scope",
+                            "blocker",
+                            "values",
+                            "min",
+                            "max",
+                            "left",
+                            "right",
+                            "relation",
+                            "days",
+                            "note",
+                            "population_basis",
+                            "reference_date",
+                        ] {
+                            rule.as_object_mut().unwrap().remove(key);
+                        }
+                    }
                     for citation in extraction["citations"].as_array_mut().unwrap() {
                         citation["source_url"] = data["source_url"].clone();
                     }
                     r.lock().unwrap().push(body);
                     let mode = m.lock().unwrap().clone();
+                    if mode == "estonian_startup" {
+                        extraction.as_object_mut().unwrap().remove("needs_review");
+                        extraction["schema_version"] = json!(2);
+                        extraction["closes_at"] = Value::Null;
+                        extraction["requirements"] = json!([
+                            {"id":"country","label":"Estonian applicant","op":"equals","field":"entity.country","value":"EE","citation_ids":["c1"]},
+                            {"id":"kind","label":"Startup applicant","op":"equals","field":"entity.kind","value":"startup","citation_ids":["c1"]},
+                            {"id":"project","label":"Unrelated technical requirement","op":"manual","note":"Technical certificate required","citation_ids":["c1"]}
+                        ]);
+                    }
                     let mut response = json!({"id":"gen-mock","model":MODEL,"provider":"OpenAI","choices":[{"finish_reason":"stop","message":{"content":extraction.to_string()}}],"usage":{"prompt_tokens":1000,"completion_tokens":200,"completion_tokens_details":{"reasoning_tokens":150},"cost":0.002}});
                     if mode == "unknown_cost" {
                         response["usage"].as_object_mut().unwrap().remove("cost");
@@ -74,6 +104,20 @@ impl Mock {
                     }
                     if mode == "parsed" {
                         response["choices"][0]["message"]["annotations"] = json!([{"type":"file"}]);
+                    }
+                    if mode == "array_error"
+                        || mode == "string_error"
+                        || mode == "malformed_provider"
+                    {
+                        let raw = match mode.as_str() {
+                            "array_error" => "[]",
+                            "string_error" => "\"rate limited\"",
+                            _ => "{invalid",
+                        };
+                        request
+                            .respond(Response::from_string(raw).with_status_code(429))
+                            .unwrap();
+                        continue;
                     }
                     request
                         .respond(Response::from_string(response.to_string()).with_header(
@@ -192,6 +236,35 @@ fn limit_cache_native_bytes_and_amendment_context() {
     assert_eq!(request["reasoning"]["effort"], "max");
     assert_eq!(request["provider"]["allow_fallbacks"], false);
     assert_eq!(request["response_format"]["json_schema"]["strict"], true);
+    let metadata: Value = serde_json::from_str(
+        request["messages"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .split("INPUT DATA:\n")
+            .nth(1)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        request["response_format"]["json_schema"]["schema"]["properties"]["citations"]["items"]["properties"]
+            ["source_url"]["enum"],
+        metadata["allowed_citation_urls"]
+    );
+    assert!(
+        metadata["allowed_citation_urls"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(notices[0].source_url))
+    );
+    assert!(
+        metadata["allowed_fields"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|definition| definition.get("scope").is_none()
+                && definition.get("readOnly").is_none())
+    );
+
     let data = request["messages"][0]["content"][1]["file"]["file_data"]
         .as_str()
         .unwrap();
@@ -417,9 +490,11 @@ fn review_retry_resends_originals_and_unsupported_files_force_review() {
     )
     .unwrap();
     assert_eq!(first.needs_review, 1);
-    assert_eq!(
-        store.latest_notices().unwrap()[0]["extraction"]["needs_review"],
-        true
+    assert!(
+        !store.latest_notices().unwrap()[0]["extraction"]["review_reasons"]
+            .as_array()
+            .unwrap()
+            .is_empty()
     );
     let mut opts = options(&temp, 1);
     opts.retry_failed = true;
@@ -496,8 +571,155 @@ fn removed_attachment_forces_review_and_original_cache_self_repairs() {
     .unwrap();
     assert_eq!(changed.needs_review, 1);
     assert_eq!(std::fs::read(cache).unwrap(), original);
-    assert_eq!(
-        store.latest_notices().unwrap()[0]["extraction"]["needs_review"],
-        true
+    assert!(
+        !store.latest_notices().unwrap()[0]["extraction"]["review_reasons"]
+            .as_array()
+            .unwrap()
+            .is_empty()
     );
+}
+
+#[test]
+fn valid_incompatible_call_is_accepted_as_extraction_not_model_rejected() {
+    let mock = Mock::new();
+    *mock.response_mode.lock().unwrap() = "estonian_startup".into();
+    let temp = TempDir::new().unwrap();
+    let mut store = db(&temp);
+    let summary = pipeline::run(
+        &mut store,
+        &http(),
+        Some(&mock.model()),
+        vec![mock.notice("startup", &[])],
+        &options(&temp, 1),
+    )
+    .unwrap();
+    assert_eq!(
+        (
+            summary.accepted,
+            summary.needs_review,
+            summary.failed,
+            summary.calls
+        ),
+        (1, 0, 0, 1)
+    );
+    let notices = store.latest_notices().unwrap();
+    assert_eq!(notices[0]["state"], "screened");
+    assert!(notices[0]["error"].is_null());
+    let municipality =
+        json!({"istatCode":"081001","region":"Sicilia","registryReferenceDate":"2026-10-06"});
+    let result = funding_rust::engine::evaluate(
+        &notices[0]["extraction"],
+        &municipality,
+        &[],
+        None,
+        "2026-10-06T12:00:00Z",
+    );
+    assert_eq!(result["state"], "excluded");
+    assert_eq!(result["window"]["state"], "unknown");
+    assert_eq!(result["results"][2]["state"], "review_required");
+    let raw: String = store
+        .conn
+        .query_row("SELECT response FROM attempts", [], |r| r.get(0))
+        .unwrap();
+    let raw: Value = serde_json::from_str(&raw).unwrap();
+    let content: Value =
+        serde_json::from_str(raw["choices"][0]["message"]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(content, notices[0]["extraction"]);
+}
+
+#[test]
+fn invalid_legacy_amendment_base_resends_all_originals_without_repairing_the_old_record() {
+    let mock = Mock::new();
+    let temp = TempDir::new().unwrap();
+    let mut store = db(&temp);
+    mock.put("/original", b"%PDF-1.4 unchanged");
+    mock.put("/annex", b"%PDF-1.4 old annex");
+    let notice = mock.notice("one", &["/original", "/annex"]);
+    pipeline::run(
+        &mut store,
+        &http(),
+        Some(&mock.model()),
+        vec![notice.clone()],
+        &options(&temp, 1),
+    )
+    .unwrap();
+    let mut legacy: Value = serde_json::from_str(include_str!("fixtures/extraction.json")).unwrap();
+    legacy["requirements"][0]["field"] = json!("entity.region");
+    legacy["requirements"][0]["value"] = json!("Sicily");
+    legacy["citations"][0]["source_url"] = json!(notice.source_url);
+    let original = legacy.to_string();
+    store
+        .conn
+        .execute("UPDATE versions SET extraction=?1 WHERE id=1", [&original])
+        .unwrap();
+    mock.put("/annex", b"%PDF-1.4 changed annex");
+    let summary = pipeline::run(
+        &mut store,
+        &http(),
+        Some(&mock.model()),
+        vec![notice],
+        &options(&temp, 1),
+    )
+    .unwrap();
+    assert_eq!(summary.calls, 1);
+    let requests = mock.requests.lock().unwrap();
+    let amended = requests.last().unwrap();
+    assert_eq!(
+        amended["messages"][0]["content"].as_array().unwrap().len(),
+        3
+    );
+    let metadata: Value = serde_json::from_str(
+        amended["messages"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .split("INPUT DATA:\n")
+            .nth(1)
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(metadata["prior_extraction_unverified"].is_null());
+    let preserved: String = store
+        .conn
+        .query_row("SELECT extraction FROM versions WHERE id=1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(preserved, original);
+}
+
+#[test]
+fn malformed_or_nonobject_provider_error_never_panics_and_retains_raw_bytes() {
+    for (mode, raw) in [
+        ("array_error", "[]"),
+        ("string_error", "\"rate limited\""),
+        ("malformed_provider", "{invalid"),
+    ] {
+        let mock = Mock::new();
+        let temp = TempDir::new().unwrap();
+        let mut store = db(&temp);
+        *mock.response_mode.lock().unwrap() = mode.into();
+        let summary = pipeline::run(
+            &mut store,
+            &http(),
+            Some(&mock.model()),
+            vec![mock.notice("bad", &[])],
+            &options(&temp, 1),
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                summary.calls,
+                summary.needs_review,
+                summary.calls_with_unknown_cost
+            ),
+            (1, 1, 1)
+        );
+        let saved: String = store
+            .conn
+            .query_row("SELECT response FROM attempts", [], |row| row.get(0))
+            .unwrap();
+        let saved: Value = serde_json::from_str(&saved).unwrap();
+        assert_eq!(saved["_raw_response"], raw);
+        assert_eq!(saved["_http_status"], 429);
+    }
 }

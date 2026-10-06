@@ -1,9 +1,13 @@
 use crate::types::{DocumentVersion, Notice, Usage};
 use anyhow::{Context, Result, ensure};
 use chrono::Utc;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::path::Path;
+
+/// Hard bounds shared by read-only export and offline replay.
+pub const MAX_DIAGNOSTIC_ATTEMPTS: usize = 1000;
+pub const MAX_DIAGNOSTIC_BYTES: usize = 64 * 1024 * 1024;
 
 pub struct Store {
     pub conn: Connection,
@@ -25,6 +29,102 @@ CREATE TABLE IF NOT EXISTS projects(municipality_id TEXT NOT NULL REFERENCES mun
 CREATE TABLE IF NOT EXISTS evidence(municipality_id TEXT NOT NULL REFERENCES municipalities(id),id TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(municipality_id,id));")?;
         Ok(Self { conn })
     }
+    /// Open an existing database without creating it, migrating it, or seeding facts.
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        ensure!(
+            path.is_file(),
+            "Diagnostic database must be an existing file"
+        );
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("Open read-only database {}", path.display()))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.execute_batch("PRAGMA query_only=ON;")?;
+        Ok(Self { conn })
+    }
+
+    /// Latest attempts, newest first. Provider response strings are exported exactly
+    /// as saved, including malformed JSON; request bodies, credentials, and files
+    /// are never read. This method is also safe on a read-only connection.
+    pub fn export_attempts(&self, limit: usize) -> Result<Vec<Value>> {
+        ensure!(
+            (1..=MAX_DIAGNOSTIC_ATTEMPTS).contains(&limit),
+            "--limit must be between 1 and {MAX_DIAGNOSTIC_ATTEMPTS}"
+        );
+        let mut stmt = self.conn.prepare(
+            "SELECT a.id,a.version_id,a.state,a.model,a.request_hash,a.response,a.usage,a.error,a.created_at,
+                    n.id,n.title,n.source_url,n.updated_at,n.latest_version,
+                    v.fingerprint,v.state,v.documents,v.source_text,v.extraction,v.error,v.created_at,
+                    length(CAST(coalesce(a.response,'') AS BLOB)) +
+                    length(CAST(coalesce(a.usage,'') AS BLOB)) +
+                    length(CAST(coalesce(a.error,'') AS BLOB)) +
+                    length(CAST(coalesce(v.documents,'') AS BLOB)) +
+                    length(CAST(coalesce(v.source_text,'') AS BLOB)) +
+                    length(CAST(coalesce(v.extraction,'') AS BLOB)) +
+                    length(CAST(coalesce(v.error,'') AS BLOB)) +
+                    length(CAST(n.title AS BLOB)) + length(CAST(n.source_url AS BLOB))
+             FROM attempts a JOIN versions v ON v.id=a.version_id
+             JOIN notices n ON n.id=v.notice_id ORDER BY a.id DESC LIMIT ?1",
+        )?;
+        let mut rows = stmt.query([limit as i64])?;
+        let mut export = Vec::new();
+        let mut bytes = 2usize;
+        while let Some(row) = rows.next()? {
+            let payload_bytes: i64 = row.get(21)?;
+            ensure!(
+                payload_bytes >= 0 && payload_bytes as u64 <= MAX_DIAGNOSTIC_BYTES as u64,
+                "Attempt exceeds the 64 MiB diagnostic export limit"
+            );
+            let version_id: i64 = row.get(1)?;
+            let latest_version: Option<i64> = row.get(13)?;
+            let json_or_raw = |column| -> rusqlite::Result<Value> {
+                Ok(row
+                    .get::<_, Option<String>>(column)?
+                    .map(|raw| serde_json::from_str(&raw).unwrap_or(Value::String(raw)))
+                    .unwrap_or(Value::Null))
+            };
+            let entry = json!({
+                "export_schema": "funding-attempt-v1",
+                "attempt_id": row.get::<_, i64>(0)?,
+                "notice_id": row.get::<_, String>(9)?,
+                "version_id": version_id,
+                "attempt_state": row.get::<_, String>(2)?,
+                "model": row.get::<_, String>(3)?,
+                "request_hash": row.get::<_, String>(4)?,
+                "response": row.get::<_, Option<String>>(5)?,
+                "usage": json_or_raw(6)?,
+                "validation_error": row.get::<_, Option<String>>(7)?,
+                "attempt_created_at": row.get::<_, String>(8)?,
+                "notice": {
+                    "id": row.get::<_, String>(9)?,
+                    "title": row.get::<_, String>(10)?,
+                    "source_url": row.get::<_, String>(11)?,
+                    "updated_at": row.get::<_, String>(12)?,
+                    "metadata_scope": "current_notice_record_not_historical_snapshot"
+                },
+                "version": {
+                    "fingerprint": row.get::<_, String>(14)?,
+                    "state": row.get::<_, String>(15)?,
+                    "documents": json_or_raw(16)?,
+                    "source_text": row.get::<_, Option<String>>(17)?,
+                    "saved_extraction": json_or_raw(18)?,
+                    "error": row.get::<_, Option<String>>(19)?,
+                    "created_at": row.get::<_, String>(20)?,
+                    "is_latest": latest_version == Some(version_id)
+                }
+            });
+            bytes = bytes.saturating_add(serde_json::to_vec(&entry)?.len() + 1);
+            ensure!(
+                bytes <= MAX_DIAGNOSTIC_BYTES,
+                "Export exceeds 64 MiB; choose a smaller --limit"
+            );
+            export.push(entry);
+        }
+        Ok(export)
+    }
+
     pub fn seed(&mut self) -> Result<()> {
         let municipalities: Vec<Value> =
             serde_json::from_str(include_str!("../data/municipalities.json"))?;
@@ -341,4 +441,74 @@ fn valid_id(value: &str) -> bool {
         && value
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "_.:-".contains(c))
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn diagnostic_export_is_read_only_and_lossless_for_responses() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("funding.sqlite");
+        let mut writer = Store::open(&path).unwrap();
+        let notice = Notice {
+            id: "notice-1".into(),
+            title: "Saved call".into(),
+            source_url: "https://example.gov/call".into(),
+            source_text: Some("Original page content".into()),
+            documents: vec![],
+        };
+        let version = writer.begin_version(&notice, "fingerprint", &[]).unwrap();
+        let attempt1 = writer.attempt(version, "hash-1").unwrap();
+        let attempt2 = writer.attempt(version, "hash-2").unwrap();
+        let raw = "{  \"error\": \"provider unavailable\"  }";
+        writer
+            .conn
+            .execute(
+                "UPDATE attempts SET response=?1,error='saved failure',usage='{bad' WHERE id=?2",
+                params![raw, attempt2],
+            )
+            .unwrap();
+        writer
+            .conn
+            .execute(
+                "UPDATE attempts SET response='not-json' WHERE id=?1",
+                [attempt1],
+            )
+            .unwrap();
+        let before = writer.stats().unwrap();
+        drop(writer);
+        let database_bytes = std::fs::read(&path).unwrap();
+        let reader = Store::open_read_only(&path).unwrap();
+        let rows = reader.export_attempts(1).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["attempt_id"], attempt2);
+        assert_eq!(rows[0]["response"], raw);
+        assert_eq!(rows[0]["validation_error"], "saved failure");
+        assert_eq!(rows[0]["usage"], "{bad");
+        assert_eq!(rows[0]["version"]["source_text"], "Original page content");
+        assert_eq!(rows[0]["version"]["documents"], json!([]));
+        assert_eq!(rows[0]["version"]["is_latest"], true);
+        assert_eq!(
+            reader.export_attempts(2).unwrap()[1]["response"],
+            "not-json"
+        );
+        assert_eq!(reader.stats().unwrap(), before);
+        assert_eq!(reader.stats().unwrap()["municipalities"], 0);
+        assert!(reader.conn.execute("DELETE FROM attempts", []).is_err());
+        assert!(reader.export_attempts(0).is_err());
+        assert!(reader.export_attempts(MAX_DIAGNOSTIC_ATTEMPTS + 1).is_err());
+        drop(reader);
+        assert_eq!(std::fs::read(&path).unwrap(), database_bytes);
+        assert!(!path.with_extension("lock").exists());
+    }
+
+    #[test]
+    fn read_only_missing_database_does_not_create_it_or_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("missing/funding.sqlite");
+        assert!(Store::open_read_only(&path).is_err());
+        assert!(!path.parent().unwrap().exists());
+    }
 }

@@ -15,6 +15,12 @@ use crate::types::{DocumentRef, Notice};
 
 const EU_API: &str =
     "https://api.tech.ec.europa.eu/search-api/prod/rest/search?apiKey=SEDIA&text=***";
+// Reference labels verified 2026-10-06 against the official SEDIA FACET API
+// (apiVersion 2.155, POST with the same query as the search API). The API guide
+// identifies this endpoint as the authority for reference-code descriptions:
+// https://ec.europa.eu/info/funding-tenders/opportunities/portal/screen/support/apis
+const EU_FACET_API: &str =
+    "https://api.tech.ec.europa.eu/search-api/prod/rest/facet?apiKey=SEDIA&text=***";
 const WP_API: &str = "https://www.euroinfosicilia.it/wp-json/wp/v2/posts";
 const MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 const EU_HOSTS: &[&str] = &["ec.europa.eu", "commission.europa.eu", "eur-lex.europa.eu"];
@@ -136,10 +142,9 @@ fn parse_eu_notice(result: &Value) -> Result<Notice> {
         first(metadata, "language") == Some("en"),
         "unexpected SEDIA language"
     );
-    ensure!(
-        matches!(first(metadata, "status"), Some("31094501" | "31094502")),
-        "unexpected SEDIA status"
-    );
+    let status_code = first(metadata, "status").context("SEDIA record missing status")?;
+    let (status, status_label) = eu_status_label(status_code)
+        .with_context(|| format!("unexpected SEDIA status {status_code}"))?;
     let kind = first(metadata, "type").context("SEDIA record missing type")?;
     let reference = required_str(result, "reference")?;
     let id = match kind {
@@ -152,17 +157,43 @@ fn parse_eu_notice(result: &Value) -> Result<Notice> {
         "8" => format!("eu:cascade:{}", id_component(reference)),
         _ => bail!("unexpected SEDIA funding type {kind}"),
     };
+    let funding_type = match kind {
+        "1" => "Grant",
+        "2" => "Calls for proposals",
+        "8" => "Cascade funding calls",
+        _ => unreachable!("funding type was validated when assigning the identity"),
+    };
     let title = if kind == "8" {
-        first(metadata, "callTitle").or_else(|| first(metadata, "title"))
+        // A missing child title must not turn its parent's title into a new call.
+        first(metadata, "callTitle")
+            .map(html_text)
+            .filter(|title| !title.is_empty())
+            .unwrap_or_else(|| format!("Cascade funding call {reference} (title unavailable)"))
     } else {
-        first(metadata, "title")
-    }
-    .context("SEDIA record missing title")?;
+        html_text(first(metadata, "title").context("SEDIA record missing title")?)
+    };
     let source_url = allowed_url(required_str(result, "url")?, None, EU_HOSTS)?;
     let mut documents = Vec::new();
     let mut sections = vec![format!(
-        "SEDIA record: {reference}\nFunding type: {kind}\nSource: {source_url}"
+        "SEDIA opportunity record: {reference}\nOpportunity ID: {id}\nOpportunity title: {title}\nFunding type: {funding_type} (SEDIA type code {kind})\nSource: {source_url}\nSource status: {status} ({status_label}; SEDIA status code {status_code})\nReference-code labels: {EU_FACET_API}\nStatus describes the supplied source snapshot, not perpetual current availability or applicant eligibility. Source dates and narratives remain separate evidence; unresolved conflicts must not be silently overwritten by this status."
     )];
+    // Do not hide a contradictory or unrecognised additional status value if
+    // the source supplies more than one; all raw values retain their meaning.
+    for other_code in strings(&metadata["status"])
+        .into_iter()
+        .filter(|code| code != status_code)
+    {
+        let explanation = match eu_status_label(&other_code) {
+            Some((other_status, label)) => format!("{other_status} ({label})"),
+            None => "unknown (unrecognised source code; no mapping inferred)".into(),
+        };
+        sections.push(format!(
+            "Additional source status: {explanation}; SEDIA status code {other_code}. Multiple differing source statuses require review."
+        ));
+    }
+    if kind == "8" {
+        sections.push("Cascade identity: the opportunity is the child call identified by this record reference and callTitle. The metadata title and identifier describe its parent grant topic; projectName/projectId describe its parent project. Parent context does not itself establish the child call's applicant requirements.".into());
+    }
     // Keep both authoritative structured dates and narratives; discrepancies
     // require later review rather than silently discarding the older deadline.
     for field in [
@@ -170,10 +201,16 @@ fn parse_eu_notice(result: &Value) -> Result<Notice> {
         "callIdentifier",
         "title",
         "callTitle",
-        "status",
+        "caName",
+        "projectName",
+        "projectAcronym",
+        "projectId",
         "startDate",
         "deadlineDate",
+        "closingDate",
         "deadlineModel",
+        "duration",
+        "esDA_IngestDate",
         "frameworkProgramme",
         "programmeDivision",
         "programmePeriod",
@@ -193,7 +230,7 @@ fn parse_eu_notice(result: &Value) -> Result<Notice> {
         if let Some(value) = metadata.get(field) {
             let text = readable_value(value);
             if !text.trim().is_empty() {
-                sections.push(format!("{field}:\n{text}"));
+                sections.push(format!("{}:\n{text}", eu_field_label(kind, field)));
             }
             for html in strings(value) {
                 documents.extend(documents_from_html(&html, &source_url, EU_HOSTS));
@@ -235,11 +272,50 @@ fn parse_eu_notice(result: &Value) -> Result<Notice> {
     dedupe_documents(&mut documents);
     Ok(Notice {
         id,
-        title: html_text(title),
+        title,
         source_url: source_url.to_string(),
         source_text: Some(sections.join("\n\n")),
         documents,
     })
+}
+
+/// Canonical extraction status plus the EC's exact human-readable facet label.
+/// Discovery still requests only forthcoming/open records; an explicitly closed
+/// response can be represented honestly without widening that search query.
+fn eu_status_label(code: &str) -> Option<(&'static str, &'static str)> {
+    match code {
+        "31094501" => Some(("forthcoming", "Forthcoming")),
+        "31094502" => Some(("open", "Open for submission")),
+        "31094503" => Some(("closed", "Closed")),
+        _ => None,
+    }
+}
+
+fn eu_field_label<'a>(kind: &str, field: &'a str) -> &'a str {
+    match (kind, field) {
+        ("8", "title") => "Parent grant topic title (metadata.title)",
+        ("8", "identifier") => "Parent grant topic identifier (metadata.identifier)",
+        ("8", "callTitle") => "Actual cascade opportunity title (metadata.callTitle)",
+        ("8", "caName") => "Cascade opportunity name (metadata.caName)",
+        ("8", "projectName") => "Parent project title (metadata.projectName)",
+        ("8", "projectAcronym") => "Parent project acronym (metadata.projectAcronym)",
+        ("8", "projectId") => "Parent project identifier (metadata.projectId)",
+        ("1", "title") => "Actual opportunity topic title (metadata.title)",
+        ("1", "identifier") => "Actual opportunity topic identifier (metadata.identifier)",
+        ("1", "callTitle") => "Parent call title (metadata.callTitle)",
+        ("1", "callIdentifier") => "Parent call identifier (metadata.callIdentifier)",
+        (_, "frameworkProgramme") => {
+            "Funding programme reference code (metadata.frameworkProgramme)"
+        }
+        (_, "esDA_IngestDate") => {
+            "Source index snapshot timestamp (metadata.esDA_IngestDate; not a current availability guarantee)"
+        }
+        (_, "closingDate") => {
+            "Source closingDate metadata (preserved independently of deadlineDate)"
+        }
+        (_, "duration") => "Source duration/application-window narrative (metadata.duration)",
+        _ => field,
+    }
 }
 
 fn discover_sicily(client: &Client, config: &Value) -> Result<Vec<Notice>> {
@@ -721,7 +797,127 @@ mod tests {
         assert_ne!(a.id, b.id);
         assert_eq!(a.title, "Actual cascade title");
         assert_eq!(a.documents[0].url, "https://ec.europa.eu/docs/call.pdf");
-        assert!(a.source_text.unwrap().contains("Comuni & partners"));
+        let text = a.source_text.unwrap();
+        assert!(text.contains("Comuni & partners"));
+        assert!(text.contains("Opportunity ID: eu:cascade:123COMPETITIVE_CALLen"));
+        assert!(text.contains("Opportunity title: Actual cascade title"));
+        assert!(text.contains(
+            "Actual cascade opportunity title (metadata.callTitle):\nActual cascade title"
+        ));
+        assert!(text.contains("Parent grant topic title (metadata.title):\nParent title"));
+        assert!(
+            text.contains("Parent grant topic identifier (metadata.identifier):\nSHARED-PARENT")
+        );
+        assert!(text.contains("Funding type: Cascade funding calls (SEDIA type code 8)"));
+    }
+
+    #[test]
+    fn official_sedia_statuses_are_decoded_without_guessing() {
+        for (code, status, label) in [
+            ("31094501", "forthcoming", "Forthcoming"),
+            ("31094502", "open", "Open for submission"),
+            ("31094503", "closed", "Closed"),
+        ] {
+            let mut record = eu_record("8", "123COMPETITIVE_CALLen");
+            record["metadata"]["status"] = json!([code]);
+            record["metadata"]["esDA_IngestDate"] = json!(["2026-09-28T10:00:00.000+0000"]);
+            let text = parse_eu_notice(&record).unwrap().source_text.unwrap();
+            assert!(text.contains(&format!(
+                "Source status: {status} ({label}; SEDIA status code {code})"
+            )));
+            assert!(!text.contains(&format!("status:\n{code}")));
+            assert!(text.contains(EU_FACET_API));
+            assert!(text.contains("supplied source snapshot, not perpetual current availability"));
+            assert!(text.contains("Source index snapshot timestamp"));
+            assert!(text.contains("2026-09-28T10:00:00.000+0000"));
+        }
+        let mut record = eu_record("1", "1TOPICen");
+        record["metadata"]["status"] = json!(["unknown-code"]);
+        assert!(parse_eu_notice(&record).is_err());
+    }
+
+    #[test]
+    fn all_supported_funding_types_have_human_labels() {
+        for (kind, label, prefix) in [
+            ("1", "Grant", "eu:topic:SHARED-PARENT"),
+            ("2", "Calls for proposals", "eu:external:1RECORDen"),
+            ("8", "Cascade funding calls", "eu:cascade:1RECORDen"),
+        ] {
+            let notice = parse_eu_notice(&eu_record(kind, "1RECORDen")).unwrap();
+            assert_eq!(notice.id, prefix);
+            assert!(
+                notice
+                    .source_text
+                    .unwrap()
+                    .contains(&format!("Funding type: {label} (SEDIA type code {kind})"))
+            );
+        }
+    }
+
+    #[test]
+    fn source_dates_narratives_and_conflicting_statuses_are_preserved() {
+        let mut record = eu_record("8", "123COMPETITIVE_CALLen");
+        record["metadata"]["status"] = json!(["31094502", "31094503"]);
+        record["metadata"]["deadlineDate"] = json!(["2026-06-28T22:59:00.000+0000"]);
+        record["metadata"]["closingDate"] = json!(["2026-05-24T00:00:00Z"]);
+        record["metadata"]["duration"] =
+            json!(["Applications close on 28 May 2026 at 23:59 CEST."]);
+        record["metadata"]["description"] = json!(["<p>Original terms remain evidence.</p>"]);
+        record["metadata"]["latestInfos"] =
+            json!(["<p>Possible extension; consult the amendment.</p>"]);
+        record["metadata"]["projectName"] = json!(["Parent project name"]);
+        record["metadata"]["projectId"] = json!(["101000123"]);
+        let notice = parse_eu_notice(&record).unwrap();
+        let text = notice.source_text.unwrap();
+        for evidence in [
+            "2026-06-28T22:59:00.000+0000",
+            "2026-05-24T00:00:00Z",
+            "Applications close on 28 May 2026 at 23:59 CEST.",
+            "Original terms remain evidence.",
+            "Possible extension; consult the amendment.",
+            "Source status: open (Open for submission; SEDIA status code 31094502)",
+            "Additional source status: closed (Closed); SEDIA status code 31094503",
+            "Parent project title (metadata.projectName):\nParent project name",
+            "Parent project identifier (metadata.projectId):\n101000123",
+        ] {
+            assert!(text.contains(evidence), "missing evidence: {evidence}");
+        }
+    }
+
+    #[test]
+    fn absent_cascade_title_does_not_relabel_parent_as_opportunity() {
+        for title in [json!([]), json!([""]), json!(["<p> </p>"])] {
+            let mut record = eu_record("8", "123COMPETITIVE_CALLen");
+            record["metadata"]["callTitle"] = title;
+            let notice = parse_eu_notice(&record).unwrap();
+            assert_eq!(
+                notice.title,
+                "Cascade funding call 123COMPETITIVE_CALLen (title unavailable)"
+            );
+            assert!(
+                notice
+                    .source_text
+                    .unwrap()
+                    .contains("Parent grant topic title (metadata.title):\nParent title")
+            );
+        }
+    }
+
+    #[test]
+    fn topic_title_and_parent_call_are_distinct() {
+        let notice = parse_eu_notice(&eu_record("1", "1TOPICen")).unwrap();
+        assert_eq!(notice.title, "Parent title");
+        let text = notice.source_text.unwrap();
+        assert!(text.contains("Actual opportunity topic title (metadata.title):\nParent title"));
+        assert!(text.contains("Parent call title (metadata.callTitle):\nActual cascade title"));
+    }
+
+    #[test]
+    fn identical_source_metadata_has_stable_text_for_caching() {
+        let record = eu_record("8", "123COMPETITIVE_CALLen");
+        let a = parse_eu_notice(&record).unwrap();
+        let b = parse_eu_notice(&record).unwrap();
+        assert_eq!(a.source_text, b.source_text);
     }
 
     #[test]

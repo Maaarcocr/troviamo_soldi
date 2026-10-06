@@ -1,3 +1,5 @@
+mod replay;
+
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use fs2::FileExt;
@@ -13,6 +15,7 @@ use reqwest::blocking::Client;
 use serde_json::Value;
 use std::{
     fs::OpenOptions,
+    io::Write,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -81,6 +84,22 @@ enum Command {
     ImportFacts {
         file: PathBuf,
     },
+    /// Export saved attempts as JSON, read-only; no discovery, API key, or model calls.
+    ExportAttempts {
+        /// Latest N attempts, newest first (1 to 1000).
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// New local file; refuses to overwrite any existing file. Default: stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Diagnose saved export/SQL rows offline; never opens or writes the runtime DB.
+    Replay {
+        file: PathBuf,
+        /// New local file; refuses to overwrite any existing file. Default: stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     Status,
 }
 fn client(timeout: u64) -> Result<Client> {
@@ -109,8 +128,105 @@ fn lock(path: &Path) -> Result<std::fs::File> {
         .context("Another writer is running. No work started")?;
     Ok(f)
 }
+/// Create-new protects the database, its sidecars, and any prior export from
+/// accidental replacement. Diagnostic files can contain private source content.
+fn write_diagnostic(value: &Value, out: Option<&Path>) -> Result<()> {
+    match out {
+        Some(path) => {
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(path).with_context(|| {
+                format!(
+                    "Create {} (existing files are never overwritten)",
+                    path.display()
+                )
+            })?;
+            serde_json::to_writer(&mut file, value)?;
+            file.write_all(b"\n")?;
+            file.flush()?;
+        }
+        None => {
+            let stdout = std::io::stdout();
+            let mut stdout = stdout.lock();
+            serde_json::to_writer(&mut stdout, value)?;
+            stdout.write_all(b"\n")?;
+        }
+    }
+    Ok(())
+}
+
+fn reject_database_output(db: &Path, out: Option<&Path>) -> Result<()> {
+    let Some(out) = out else {
+        return Ok(());
+    };
+    let identity = |path: &Path| -> Result<PathBuf> {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        // A writable output's parent must exist. Existing parents are resolved
+        // for symlink aliases as well as lexical `..` paths.
+        let parent = if parent.exists() {
+            parent.canonicalize()?
+        } else {
+            std::env::current_dir()?.join(parent)
+        };
+        Ok(parent.join(
+            path.file_name()
+                .context("Diagnostic path must name a file")?,
+        ))
+    };
+    let out = identity(out)?;
+    let mut protected = vec![db.to_path_buf(), db.with_extension("lock")];
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut path = db.as_os_str().to_os_string();
+        path.push(suffix);
+        protected.push(PathBuf::from(path));
+    }
+    for path in protected {
+        ensure!(
+            out != identity(&path)?,
+            "Diagnostic output must not be the database or one of its sidecar/lock files"
+        );
+    }
+    Ok(())
+}
+
+/// Run before writer lock, initialization, seeding, configuration, or HTTP setup.
+fn read_only_command(cli: &Cli) -> Result<bool> {
+    match &cli.command {
+        Command::ExportAttempts { limit, out } => {
+            reject_database_output(&cli.db, out.as_deref())?;
+            ensure!(
+                (1..=funding_rust::store::MAX_DIAGNOSTIC_ATTEMPTS).contains(limit),
+                "--limit must be between 1 and 1000"
+            );
+            let store = Store::open_read_only(&cli.db)?;
+            write_diagnostic(
+                &serde_json::to_value(store.export_attempts(*limit)?)?,
+                out.as_deref(),
+            )?;
+            Ok(true)
+        }
+        Command::Replay { file, out } => {
+            reject_database_output(&cli.db, out.as_deref())?;
+            write_diagnostic(&replay::from_file(file)?, out.as_deref())?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if read_only_command(&cli)? {
+        return Ok(());
+    }
     if let Command::Serve { bind } = cli.command {
         return web::serve(&cli.db, &bind);
     }
@@ -235,7 +351,143 @@ fn main() -> Result<()> {
             )?;
             println!("{}", serde_json::to_string_pretty(&summary)?);
         }
-        Command::Serve { .. } => unreachable!(),
+        Command::Serve { .. } | Command::ExportAttempts { .. } | Command::Replay { .. } => {
+            unreachable!()
+        }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod diagnostic_cli_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn replay_never_creates_or_opens_configured_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("saved.json");
+        let output = temp.path().join("report.json");
+        let db = temp.path().join("nonexistent/runtime.sqlite");
+        std::fs::write(&input, r#"[{"attempt_id":1,"notice_id":"notice-1","response":null,"validation_error":"transport error"}]"#).unwrap();
+        let cli = Cli {
+            db: db.clone(),
+            command: Command::Replay {
+                file: input,
+                out: Some(output.clone()),
+            },
+        };
+        assert!(read_only_command(&cli).unwrap());
+        assert!(!db.parent().unwrap().exists());
+        let report: Value = serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+        assert_eq!(report["model_calls"], 0);
+        assert_eq!(report["database_writes"], 0);
+        assert_eq!(report["results"][0]["category"], "no_saved_response");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn exports_and_replays_local_database_without_initialization_or_changes() {
+        use funding_rust::types::Usage;
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("runtime.sqlite");
+        let export = temp.path().join("attempts.json");
+        let report = temp.path().join("report.json");
+        let mut store = Store::open(&db).unwrap();
+        let notice = Notice {
+            id: "call-1".into(),
+            title: "Fixture".into(),
+            source_url: "https://example.gov/call.pdf".into(),
+            source_text: Some("Official source".into()),
+            documents: vec![],
+        };
+        let version = store.begin_version(&notice, "fingerprint", &[]).unwrap();
+        let attempt = store.attempt(version, "request-hash").unwrap();
+        let extraction: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/extraction.json")).unwrap();
+        let response = json!({"model":funding_rust::model::MODEL,"choices":[{"finish_reason":"stop","message":{"content":extraction.to_string()}}],"usage":{"cost":0.005}});
+        store
+            .finish_attempt(
+                attempt,
+                "needs_review",
+                Some(&response),
+                &Usage::from_response(&response),
+                Some("old contract error"),
+            )
+            .unwrap();
+        let before = store.stats().unwrap();
+        drop(store);
+        let before_bytes = std::fs::read(&db).unwrap();
+        assert!(
+            read_only_command(&Cli {
+                db: db.clone(),
+                command: Command::ExportAttempts {
+                    limit: 1,
+                    out: Some(export.clone())
+                }
+            })
+            .unwrap()
+        );
+        assert!(
+            read_only_command(&Cli {
+                db: db.clone(),
+                command: Command::Replay {
+                    file: export,
+                    out: Some(report.clone())
+                }
+            })
+            .unwrap()
+        );
+        let actual: Value = serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
+        assert_eq!(actual["results"][0]["category"], "valid_extraction");
+        assert_eq!(
+            actual["results"][0]["stored_validation_error"],
+            "old contract error"
+        );
+        assert_eq!(actual["results"][0]["saved_usage"]["cost_usd"], 0.005);
+        let store = Store::open_read_only(&db).unwrap();
+        assert_eq!(store.stats().unwrap(), before);
+        drop(store);
+        assert_eq!(std::fs::read(&db).unwrap(), before_bytes);
+        assert!(!db.with_extension("lock").exists());
+    }
+
+    #[test]
+    fn output_cannot_replace_input_database_or_existing_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let existing = temp.path().join("existing.json");
+        std::fs::write(&existing, b"keep me").unwrap();
+        assert!(write_diagnostic(&json!({}), Some(&existing)).is_err());
+        assert_eq!(std::fs::read(&existing).unwrap(), b"keep me");
+        let db = temp.path().join("runtime.sqlite");
+        assert!(reject_database_output(&db, Some(&db)).is_err());
+        assert!(
+            reject_database_output(&db, Some(&temp.path().join("runtime.sqlite-wal"))).is_err()
+        );
+        assert!(reject_database_output(&db, Some(&db.with_extension("lock"))).is_err());
+        assert!(reject_database_output(&db, Some(&temp.path().join("report.json"))).is_ok());
+    }
+
+    #[test]
+    fn invalid_export_limit_does_not_create_missing_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("missing/runtime.sqlite");
+        for limit in [0, 1001] {
+            assert!(
+                read_only_command(&Cli {
+                    db: db.clone(),
+                    command: Command::ExportAttempts { limit, out: None }
+                })
+                .is_err()
+            );
+        }
+        assert!(!db.parent().unwrap().exists());
+    }
 }

@@ -4,7 +4,7 @@ Comuni / bandi, in Rust
 
 One binary. SQLite. Original files go to Luna. No PDF extraction, OCR, agents, Python, workflow service, or JavaScript frontend.
 
-The daily command discovers notices, hashes their original attachments, processes only new/changed versions with `openai/gpt-6-luna` at `reasoning.effort=max`, validates the returned rules, and saves usage. The same binary serves a small read-only Italian interface. Municipality/project changes are evaluated locally and make **no AI calls**.
+The daily command discovers notices, hashes their original attachments, processes only new/changed versions with `openai/gpt-6-luna` at `reasoning.effort=max`, validates the returned factual conditions, and saves usage. The same binary serves a small read-only Italian interface. Municipality/project changes are evaluated locally and make **no AI calls**.
 
 ## Run locally
 
@@ -61,14 +61,42 @@ The generic six-operator evaluator uses `data/fields.json`. It does not branch o
 
 ## Coverage and interpretation limits
 
-- EU SEDIA: official current index, English open/forthcoming records, types 1/2/8. Topic IDs remain distinct; cascade records keep their own IDs. External cascade sites are not recursively crawled.
+- EU SEDIA: official current index, English open/forthcoming records, types 1/2/8. Topic IDs remain distinct; cascade records keep their own IDs. The prompt receives decoded status/type labels and distinct child-call versus parent-topic/project identities. Status labels were verified against the official SEDIA FACET API; “Open for submission” is a source snapshot observation, not proof of present eligibility. Structured deadlines, closing dates and narrative duration/windows remain separate when they disagree. External cascade sites are not recursively crawled.
 - EuroInfoSicilia: audited Bandi category union, including closed results/amendments; article HTML is inspected because WordPress bodies can omit attachment links. It is not every Regione department or all 5,116 regional posts.
 - National sources: simple explicit/manual feed additions. No claim of an all-Italy or all-EU complete funding catalogue.
 - A source article is not necessarily one unique funding opportunity. Multi-invitation articles and unsupported alternative legal routes must remain review cases. There is no automatic cross-source semantic merging.
 - Source/page/count errors fail discovery rather than silently advertise complete refreshes. Metadata or absence from a listing does not itself close an opportunity. Current configured discovery still costs network/time even with a small AI limit.
 - Conditions are a flat conjunction of validated `equals`, `one_of`, `range`, `compare`, `min_days`, and `manual` rules. Unsupported logic must be manual/review, not generated executable code.
-- Every requirement cites a supplied source URL. Quote/page text is **model-reported, not independently validated against PDFs**. Strict JSON is not proof of legal interpretation. Nothing here grants legal clearance.
-- Closed and ineligible records are hidden by default and available through the archive checkbox. Unknown/review cases stay visible. Old or unavailable source checks need review; the web view does not fetch current documents.
+- Every requirement cites a supplied source URL. The prompt and request-specific JSON schema contain the same citation URL allowlist as Rust validation; links merely mentioned in source content are not separately supplied evidence. Quote/page text is **model-reported, not independently validated against PDFs**. Strict JSON is not proof of legal interpretation. Nothing here grants legal clearance.
+- Closed and ineligible records are hidden by default and available through the archive checkbox. Unsettled unknown/review cases stay visible; definite applicant mismatches stay excluded even when unrelated facts are unknown. Old or unavailable source checks need review; the web view does not fetch current documents.
+
+## Extraction contract and zero-cost diagnostics
+
+Luna extracts source facts; Rust decides applicability. Contract version 2 uses compact, cited conditions:
+
+```json
+{"id":"country","label":"Sede in Estonia","op":"one_of","field":"entity.country","values":["EE"],"citation_ids":["c1"]}
+```
+
+An additional `entity.kind = startup` condition describes a startup-only call. Both conditions can be valid extractions even when an Italian municipality does not match. Country values are ISO alpha-2 codes; entity types and Italian regions use the catalogue's canonical identifiers (`Sicilia`, not `Sicily`). Broad public-body eligibility is `entity.publicBody = true`, not a narrower invented entity type. Other categories stay manual when they cannot be represented faithfully. Numeric financial fields are EUR; other currencies stay manual.
+
+- The model never supplies `scope` or `blocker`. Rust derives them from the evidence field. The legacy internal `municipality` scope means applicant-intrinsic information.
+- Each operator has only its own arguments. A manual clause has `id`, `label`, `op`, `note`, and `citation_ids`; it cannot carry a field or unused numeric arguments.
+- Conditions are ANDed; `one_of` allows alternative values of one field. Other alternatives/uncertainty remain manual. If missing coverage, contradictions or alternative eligibility routes could invalidate a definite condition, `review_reasons` keeps the entire result under review.
+- Unknown deadline/status and unrelated project/manual conditions remain individually unknown. They do not undo a clearly cited, definite applicant country/type mismatch. They do prevent a positive match when there is no settled exclusion.
+- `accepted` counts successfully extracted source facts without source-level review flags. It is **not** the number of eligible grants. CLI diagnostics print unresolved facts separately; local matching produces `excluded`, `ineligible`, `screening_match` or review states with reasons.
+- Existing SQLite tables, cached versions, raw provider responses and legacy extractions are retained. Legacy review outputs are not silently repaired or promoted. Invalid legacy records remain visible for review; an invalid prior extraction cannot suppress unchanged originals during an already-requested amendment analysis. New provider responses must use version 2; legacy shapes are accepted only by the stored-data/replay path. Duplicate JSON keys are rejected rather than allowing a later key to erase uncertainty. Merely upgrading does not issue paid calls or rewrite old results.
+
+To diagnose saved attempts without spending again:
+
+```sh
+./target/release/funding-rust --db var/funding.sqlite export-attempts --limit 10 --out attempts.json
+./target/release/funding-rust replay attempts.json --out replay.json
+```
+
+Export opens SQLite read-only. Replay reads only the JSON file; it does not open SQLite, discover sources, fetch originals, call a model or import recovered facts. Both commands refuse to overwrite an existing output file. Exports contain original response bytes as saved, source/version metadata and historical usage, so treat them as private diagnostic files.
+
+Reports distinguish provider failures/truncation, invalid JSON, contract errors and valid-but-unresolved facts. A bare SQL export with only `attempt_id`, `notice_id`, `response` and `validation_error` is accepted for syntax/provider diagnosis; without independent source metadata it reports structural errors and source-reported manual/review reasons separately and cannot validate citation URLs. Historical versions lacking their original notice-URL snapshot also remain diagnosis-only. No quotation is independently verified against original PDFs. Do not use `--retry-failed` to diagnose: that flag can spend money again.
 
 ## Actual cost reporting
 
@@ -96,7 +124,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test --all-targets --locked
 ```
 
-Tests use local HTTP mocks and fixtures, never paid requests. They cover exact original-byte payloads, native-only/max-effort parameters, strict schema, bounded calls, changed files, cached versions, partial/failed usage, unknown cost, isolated facts, all six rule operators and safe HTML filtering. An optional ignored adapter regression accepts the separately retained audit snapshots through `FUNDING_AUDIT_DIR`; those bulky source snapshots are not required or bundled.
+Tests use local HTTP mocks and fixtures, never paid requests. Compact-contract regressions cover Estonian startup versus Italian municipality, open municipal/public-body calls, genuine eligibility ambiguity, unknown unrelated project/deadline facts, both reported invalid scope/manual combinations, and read-only export/replay. They cover exact original-byte payloads, native-only/max-effort parameters, strict schema, bounded calls, changed files, cached versions, partial/failed usage, unknown cost, isolated facts, all six rule operators and safe HTML filtering. An optional ignored adapter regression accepts the separately retained audit snapshots through `FUNDING_AUDIT_DIR`; those bulky source snapshots are not required or bundled.
 
 Provider docs checked 6 October 2026:
 - [Native PDF inputs](https://openrouter.ai/docs/guides/overview/multimodal/pdfs)
