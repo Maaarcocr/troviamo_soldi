@@ -59,14 +59,6 @@ enum Command {
         /// Reattempt an unchanged failed/review/in-flight version; may duplicate uncertain billing.
         #[arg(long)]
         retry_failed: bool,
-        /// Combined reasoning + visible output token allowance (effort always max).
-        #[arg(long, default_value_t = 32768)]
-        max_tokens: u32,
-        /// Application byte limit, not a provider guarantee.
-        #[arg(long, default_value_t = 25)]
-        max_file_mib: usize,
-        #[arg(long, default_value_t = 50)]
-        max_notice_mib: usize,
     },
     /// Discover source records without making model calls.
     Discover {
@@ -102,10 +94,10 @@ enum Command {
     },
     Status,
 }
-fn client(timeout: u64) -> Result<Client> {
+fn client(timeout: Option<Duration>) -> Result<Client> {
     Ok(Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(timeout))
+        .timeout(timeout)
         .user_agent("FundingRust/0.1 (official funding source research)")
         .build()?)
 }
@@ -244,7 +236,10 @@ fn main() -> Result<()> {
             sources: source_path,
             out,
         } => {
-            let notices = sources::discover(&client(120)?, &config(&source_path)?)?;
+            let notices = sources::discover(
+                &client(Some(Duration::from_secs(120)))?,
+                &config(&source_path)?,
+            )?;
             std::fs::write(&out, serde_json::to_vec_pretty(&notices)?)?;
             println!(
                 "Discovered {} records → {}. Coverage is limited to configured sources.",
@@ -261,19 +256,8 @@ fn main() -> Result<()> {
             allow_paid,
             mock_url,
             retry_failed,
-            max_tokens,
-            max_file_mib,
-            max_notice_mib,
         } => {
             ensure!(limit > 0, "--limit must be greater than zero");
-            ensure!(
-                (1024..=128000).contains(&max_tokens),
-                "--max-tokens must be between 1024 and 128000"
-            );
-            ensure!(
-                (1..=100).contains(&max_file_mib) && (1..=200).contains(&max_notice_mib),
-                "Invalid application byte limits"
-            );
             ensure!(
                 !(allow_paid && mock_url.is_some()),
                 "--allow-paid and --mock-url are mutually exclusive"
@@ -305,10 +289,9 @@ fn main() -> Result<()> {
                     (ENDPOINT.into(), Some(key))
                 };
                 Some(ModelClient {
-                    http: client(600)?,
+                    http: client(None)?,
                     endpoint,
                     api_key,
-                    max_tokens,
                 })
             };
             if retry_failed {
@@ -327,7 +310,7 @@ fn main() -> Result<()> {
                         .map(str::to_owned)
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let http = client(120)?;
+            let http = client(Some(Duration::from_secs(120)))?;
             let notices: Vec<Notice> = if let Some(input) = input {
                 serde_json::from_slice(&std::fs::read(input)?)?
             } else {
@@ -345,8 +328,6 @@ fn main() -> Result<()> {
                     allow_localhost,
                     retry_failed,
                     dry_run,
-                    max_file_bytes: max_file_mib * 1024 * 1024,
-                    max_notice_bytes: max_notice_mib * 1024 * 1024,
                 },
             )?;
             println!("{}", serde_json::to_string_pretty(&summary)?);

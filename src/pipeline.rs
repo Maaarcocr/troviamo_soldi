@@ -18,8 +18,6 @@ pub struct RunOptions {
     pub allow_localhost: bool,
     pub retry_failed: bool,
     pub dry_run: bool,
-    pub max_file_bytes: usize,
-    pub max_notice_bytes: usize,
 }
 pub fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -45,10 +43,7 @@ pub fn run(
         if !seen.insert(notice.id.clone()) {
             continue;
         }
-        ensure!(
-            !notice.id.is_empty() && notice.id.len() <= 300,
-            "Invalid notice ID"
-        );
+        ensure!(!notice.id.is_empty(), "Invalid notice ID");
         let previous = store.previous(&notice.id)?;
         let prepared = prepare(client, &notice, options);
         let documents = match prepared {
@@ -104,15 +99,14 @@ pub fn run(
         }
         let version = store.begin_version(&notice, &fingerprint, &documents)?;
         let model = model.context("Model client missing for non-dry run")?;
-        let body =
-            match model::request_body(&notice, &documents, &options.cache_dir, model.max_tokens) {
-                Ok(body) => body,
-                Err(error) => {
-                    summary.failed += 1;
-                    store.finish_version(version, "failed", None, Some(&error.to_string()))?;
-                    continue;
-                }
-            };
+        let body = match model::request_body(&notice, &documents, &options.cache_dir) {
+            Ok(body) => body,
+            Err(error) => {
+                summary.failed += 1;
+                store.finish_version(version, "failed", None, Some(&error.to_string()))?;
+                continue;
+            }
+        };
         let attempt = store.attempt(version, &sha256(serde_json::to_string(&body)?.as_bytes()))?;
         summary.calls += 1;
         let response = model.send(&body);
@@ -218,10 +212,6 @@ fn fingerprint(notice: &Notice, docs: &[DocumentVersion]) -> Result<String> {
 }
 fn prepare(client: &Client, notice: &Notice, options: &RunOptions) -> Result<Vec<DocumentVersion>> {
     validate_url(&notice.source_url, options)?;
-    ensure!(
-        notice.documents.len() <= 20,
-        "More than 20 files; application limit requires manual review"
-    );
     let has_source_text = notice
         .source_text
         .as_ref()
@@ -230,27 +220,13 @@ fn prepare(client: &Client, notice: &Notice, options: &RunOptions) -> Result<Vec
         has_source_text || !notice.documents.is_empty(),
         "No source content supplied: provide source_text or original documents, or use source discovery; a URL alone is not extraction input. No model call made"
     );
-    ensure!(
-        notice
-            .source_text
-            .as_ref()
-            .is_none_or(|s| s.len() <= 2 * 1024 * 1024),
-        "Source text exceeds application limit; not truncated"
-    );
     let mut documents = Vec::new();
-    let mut total = 0;
     let mut urls = HashSet::new();
     for document in &notice.documents {
         if !urls.insert(&document.url) {
             continue;
         }
-        let (bytes, server_mime) =
-            download(client, &document.url, options, options.max_file_bytes)?;
-        total += bytes.len();
-        ensure!(
-            total <= options.max_notice_bytes,
-            "Original files exceed per-notice application byte limit; no model call"
-        );
+        let (bytes, server_mime) = download(client, &document.url, options)?;
         let mime = sniff_type(&bytes).unwrap_or("application/octet-stream");
         ensure!(
             !server_mime.starts_with("text/html")
@@ -339,15 +315,10 @@ fn validate_url(value: &str, options: &RunOptions) -> Result<Url> {
     }
     Ok(url)
 }
-fn download(
-    client: &Client,
-    value: &str,
-    options: &RunOptions,
-    max_bytes: usize,
-) -> Result<(Vec<u8>, String)> {
+fn download(client: &Client, value: &str, options: &RunOptions) -> Result<(Vec<u8>, String)> {
     let mut url = validate_url(value, options)?;
     for _ in 0..=5 {
-        let response = client
+        let mut response = client
             .get(url.clone())
             .send()
             .context("Fetch original source")?;
@@ -366,12 +337,6 @@ fn download(
             response.status(),
             url
         );
-        ensure!(
-            response
-                .content_length()
-                .is_none_or(|len| len <= max_bytes as u64),
-            "Download exceeds configured application byte limit"
-        );
         let mime = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -383,13 +348,7 @@ fn download(
             .trim()
             .to_owned();
         let mut bytes = Vec::new();
-        response
-            .take(max_bytes as u64 + 1)
-            .read_to_end(&mut bytes)?;
-        ensure!(
-            bytes.len() <= max_bytes,
-            "Download exceeds configured application byte limit"
-        );
+        response.read_to_end(&mut bytes)?;
         return Ok((bytes, mime));
     }
     bail!("Too many redirects")

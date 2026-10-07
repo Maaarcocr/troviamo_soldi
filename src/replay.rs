@@ -54,8 +54,8 @@ pub fn replay(input: &Value) -> Result<Value> {
         ensure!(
             row["notice_id"]
                 .as_str()
-                .is_some_and(|id| !id.trim().is_empty() && id.len() <= 300),
-            "Replay row {} needs a nonempty notice_id (maximum 300 bytes)",
+                .is_some_and(|id| !id.trim().is_empty()),
+            "Replay row {} needs a nonempty notice_id",
             index + 1
         );
         ensure!(
@@ -290,10 +290,6 @@ fn input_sources(row: &Value) -> Result<Vec<String>> {
     let documents: Vec<DocumentVersion> =
         serde_json::from_value(row["version"]["documents"].clone())
             .context("Export has missing or invalid version document metadata")?;
-    ensure!(
-        documents.len() <= 20,
-        "Export has more than 20 documents for one version"
-    );
     let mut sources = vec![source.to_owned()];
     sources.extend(documents.into_iter().map(|document| document.url));
     for source in &sources {

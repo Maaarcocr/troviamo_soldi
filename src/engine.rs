@@ -66,19 +66,18 @@ fn has_unsafe_controls(value: &str) -> bool {
         .chars()
         .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
 }
-fn text<'a>(value: &'a Value, name: &str, min: usize, max: usize) -> Result<&'a str> {
+fn text<'a>(value: &'a Value, name: &str) -> Result<&'a str> {
     let value = value
         .as_str()
         .with_context(|| format!("{name} must be a string"))?;
-    let length = value.trim().chars().count();
     ensure!(
-        length >= min && length <= max && !has_unsafe_controls(value),
-        "{name} has invalid length/content"
+        !value.trim().is_empty() && !has_unsafe_controls(value),
+        "{name} must be nonblank text without unsafe controls"
     );
     Ok(value)
 }
 fn identifier<'a>(value: &'a Value, name: &str) -> Result<&'a str> {
-    text(value, name, 1, 160)
+    text(value, name)
 }
 fn enumeration<'a>(value: &'a Value, options: &[&str], name: &str) -> Result<&'a str> {
     let value = value
@@ -101,13 +100,13 @@ fn nullable_date(value: &Value, name: &str) -> Result<()> {
     );
     Ok(())
 }
-fn numeric(value: &Value, name: &str, min: f64, max: f64) -> Result<f64> {
+fn numeric(value: &Value, name: &str) -> Result<f64> {
     let number = value
         .as_f64()
         .with_context(|| format!("{name} must be numeric"))?;
     ensure!(
-        number.is_finite() && number >= min && number <= max,
-        "{name} outside supported bounds"
+        number.is_finite() && number >= 0.0,
+        "{name} must be finite and nonnegative"
     );
     Ok(number)
 }
@@ -118,25 +117,26 @@ fn valid_value(value: &Value, definition: &Value) -> bool {
     match definition["type"].as_str() {
         Some("boolean") => value.is_boolean(),
         Some("number") => value.as_f64().is_some_and(|v| {
-            v.is_finite()
-                && (0.0..=1e15).contains(&v)
-                && (definition["integer"] != true || v.fract() == 0.0)
+            v.is_finite() && v >= 0.0 && (definition["integer"] != true || v.fract() == 0.0)
         }),
         Some("date") => value.as_str().and_then(date).is_some(),
         Some("enum") => definition["options"]
             .as_array()
             .is_some_and(|options| options.iter().any(|option| option["value"] == *value)),
-        Some("string") => value.as_str().is_some_and(|v| {
-            !v.trim().is_empty() && v.chars().count() <= 3000 && !has_unsafe_controls(v)
-        }),
+        Some("string") => value
+            .as_str()
+            .is_some_and(|v| !v.trim().is_empty() && !has_unsafe_controls(v)),
         _ => false,
     }
 }
-fn equal_values(left: &Value, right: &Value) -> bool {
-    match (left.as_f64(), right.as_f64()) {
-        (Some(left), Some(right)) => left == right,
-        _ => left == right,
+fn compare_numbers(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
+    if let (Some(left), Some(right)) = (left.as_u64(), right.as_u64()) {
+        return Some(left.cmp(&right));
     }
+    left.as_f64()?.partial_cmp(&right.as_f64()?)
+}
+fn equal_values(left: &Value, right: &Value) -> bool {
+    compare_numbers(left, right).map_or_else(|| left == right, |order| order.is_eq())
 }
 fn definition(field: &str) -> Result<&'static Value> {
     fields()
@@ -193,8 +193,8 @@ fn validate_extraction_inner(
     require_deadline_review_flag: bool,
 ) -> Result<()> {
     closed_object(value, TOP_KEYS, "Extraction")?;
-    text(&value["title"], "title", 1, 500)?;
-    text(&value["summary"], "summary", 1, 10_000)?;
+    text(&value["title"], "title")?;
+    text(&value["summary"], "summary")?;
     let status = enumeration(
         &value["status"],
         &["open", "forthcoming", "closed", "unknown"],
@@ -204,7 +204,7 @@ fn validate_extraction_inner(
     let closes = if value["closes_at"].is_null() {
         None
     } else {
-        let raw = text(&value["closes_at"], "closes_at", 20, 64)?;
+        let raw = text(&value["closes_at"], "closes_at")?;
         Some(
             DateTime::parse_from_rfc3339(raw)
                 .context("closes_at must be an RFC3339 timestamp with timezone")?,
@@ -222,9 +222,8 @@ fn validate_extraction_inner(
     let reasons = value["review_reasons"]
         .as_array()
         .context("review_reasons must be an array")?;
-    ensure!(reasons.len() <= 100, "Too many review reasons");
     for reason in reasons {
-        text(reason, "review reason", 1, 3000)?;
+        text(reason, "review reason")?;
     }
     ensure!(
         needs_review == !reasons.is_empty(),
@@ -241,7 +240,6 @@ fn validate_extraction_inner(
     let citations = value["citations"]
         .as_array()
         .context("citations must be an array")?;
-    ensure!(citations.len() <= 300, "Too many citations");
     let mut citation_ids = HashSet::new();
     for citation in citations {
         closed_object(
@@ -251,7 +249,7 @@ fn validate_extraction_inner(
         )?;
         let id = identifier(&citation["id"], "citation id")?;
         ensure!(citation_ids.insert(id), "Duplicate citation id: {id}");
-        let source = text(&citation["source_url"], "citation source_url", 8, 3000)?;
+        let source = text(&citation["source_url"], "citation source_url")?;
         ensure!(
             (source.starts_with("https://") || source.starts_with("http://"))
                 && !source.chars().any(char::is_whitespace),
@@ -262,14 +260,13 @@ fn validate_extraction_inner(
             "Citation source is outside the supplied official source list: {source}"
         );
         if !citation["locator"].is_null() {
-            text(&citation["locator"], "citation locator", 1, 1000)?;
+            text(&citation["locator"], "citation locator")?;
         }
-        text(&citation["quote"], "citation quote", 1, 10_000)?;
+        text(&citation["quote"], "citation quote")?;
     }
     let requirements = value["requirements"]
         .as_array()
         .context("requirements must be an array")?;
-    ensure!(requirements.len() <= 200, "Too many requirements");
     ensure!(
         !requirements.is_empty() || needs_review,
         "An empty requirement list requires review"
@@ -280,7 +277,7 @@ fn validate_extraction_inner(
             closed_object(rule, RULE_KEYS, "Requirement")?;
             let id = identifier(&rule["id"], "requirement id")?;
             ensure!(ids.insert(id), "Duplicate requirement id: {id}");
-            text(&rule["label"], "requirement label", 1, 1000)?;
+            text(&rule["label"], "requirement label")?;
             let op = enumeration(&rule["op"], OPS, "operator")?;
             let scope = enumeration(&rule["scope"], SCOPES, "scope")?;
             enumeration(
@@ -293,7 +290,7 @@ fn validate_extraction_inner(
                 "Project/application evidence cannot exclude an applicant globally"
             );
             if !rule["note"].is_null() {
-                text(&rule["note"], "note", 1, 5000)?;
+                text(&rule["note"], "note")?;
             }
             nullable_date(&rule["reference_date"], "reference_date")?;
             if !rule["population_basis"].is_null() {
@@ -307,8 +304,8 @@ fn validate_extraction_inner(
                 .as_array()
                 .context("citation_ids must be an array")?;
             ensure!(
-                !references.is_empty() && references.len() <= 30,
-                "Each requirement needs 1–30 citations"
+                !references.is_empty(),
+                "Each requirement needs at least one citation"
             );
             for reference in references {
                 let reference = reference.as_str().context("Citation id must be a string")?;
@@ -334,7 +331,7 @@ fn validate_extraction_inner(
                         "reference_date",
                     ],
                 )?;
-                text(&rule["note"], "manual note", 1, 5000)?;
+                text(&rule["note"], "manual note")?;
                 return Ok(());
             }
             if op == "compare" {
@@ -345,8 +342,8 @@ fn validate_extraction_inner(
                         .as_array()
                         .with_context(|| format!("{side} must be a term array"))?;
                     ensure!(
-                        !terms.is_empty() && terms.len() <= 20,
-                        "Comparison sides require 1–20 terms"
+                        !terms.is_empty(),
+                        "Comparison sides require at least one term"
                     );
                     let mut seen = HashSet::new();
                     for term in terms {
@@ -359,7 +356,7 @@ fn validate_extraction_inner(
                             "Comparison terms must be numeric fields"
                         );
                         ensure!(seen.insert(field), "Duplicate comparison field in one side");
-                        let factor = numeric(&term["factor"], "factor", 0.0, 1e6)?;
+                        let factor = numeric(&term["factor"], "factor")?;
                         ensure!(factor > 0.0, "Term factor must be positive");
                     }
                 }
@@ -402,12 +399,11 @@ fn validate_extraction_inner(
                         );
                         for bound in ["min", "max"] {
                             if !rule[bound].is_null() {
-                                numeric(&rule[bound], bound, 0.0, 1e15)?;
+                                numeric(&rule[bound], bound)?;
                             }
                         }
-                        if let (Some(min), Some(max)) = (rule["min"].as_f64(), rule["max"].as_f64())
-                        {
-                            ensure!(min <= max, "range min exceeds max");
+                        if let Some(order) = compare_numbers(&rule["min"], &rule["max"]) {
+                            ensure!(!order.is_gt(), "range min exceeds max");
                         }
                     }
                     "min_days" => {
@@ -417,8 +413,8 @@ fn validate_extraction_inner(
                             "min_days requires a date field"
                         );
                         ensure!(
-                            rule["days"].as_u64().is_some_and(|n| n <= 36_600),
-                            "days must be an integer between 0 and 36600"
+                            rule["days"].as_u64().is_some(),
+                            "days must be a nonnegative integer"
                         );
                     }
                     _ => unreachable!(),
@@ -778,9 +774,8 @@ fn evaluate_rule(
             .iter()
             .any(|candidate| equal_values(candidate, value(field))),
         "range" => {
-            let number = value(field).as_f64().unwrap();
-            rule["min"].as_f64().is_none_or(|min| number >= min)
-                && rule["max"].as_f64().is_none_or(|max| number <= max)
+            compare_numbers(value(field), &rule["min"]).is_none_or(|order| !order.is_lt())
+                && compare_numbers(value(field), &rule["max"]).is_none_or(|order| !order.is_gt())
         }
         "compare" => {
             let sum = |side: &str| -> f64 {
@@ -796,6 +791,13 @@ fn evaluate_rule(
             };
             let left = sum("left");
             let right = sum("right");
+            if !left.is_finite() || !right.is_finite() {
+                return complete(
+                    "review_required",
+                    "Comparison exceeds numeric precision",
+                    json!(facts),
+                );
+            }
             // Same half-cent arithmetic tolerance as the original data-only screener.
             if rule["relation"] == "lte" {
                 left <= right + 0.005
@@ -804,8 +806,8 @@ fn evaluate_rule(
             }
         }
         "min_days" => {
-            (date(value(field).as_str().unwrap()).unwrap() - as_of.date).num_days()
-                >= rule["days"].as_i64().unwrap()
+            let days = (date(value(field).as_str().unwrap()).unwrap() - as_of.date).num_days();
+            days >= 0 && days as u64 >= rule["days"].as_u64().unwrap()
         }
         _ => false,
     };
@@ -1261,11 +1263,47 @@ mod tests {
     }
 
     #[test]
+    fn large_integer_equality_and_ranges_remain_exact() {
+        let smaller = json!(9_007_199_254_740_992_u64);
+        let larger = json!(9_007_199_254_740_993_u64);
+        let evidence = vec![record("project.totalCost", larger.clone())];
+        assert_eq!(
+            result_state(&run(
+                equality("project.totalCost", smaller.clone()),
+                evidence.clone()
+            )),
+            "fail"
+        );
+        let mut range = rule("range", Some("project.totalCost"));
+        range["max"] = smaller;
+        assert_eq!(result_state(&run(range.clone(), evidence)), "fail");
+        range["min"] = larger;
+        assert!(validate_extraction(&extraction(range), &sources()).is_err());
+    }
+
+    #[test]
+    fn large_finite_numbers_are_valid_but_overflow_is_not_a_match() {
+        let mut rule = comparison();
+        rule["left"][0]["factor"] = json!(1e8);
+        let evidence = vec![
+            record("application.requestedGrant", json!(1e16)),
+            record("application.eligibleCost", json!(1e30)),
+        ];
+        assert_eq!(result_state(&run(rule.clone(), evidence)), "pass");
+        rule["left"][0]["factor"] = json!(1e308);
+        rule["right"][0]["factor"] = json!(1e308);
+        let evidence = vec![
+            record("application.requestedGrant", json!(1e308)),
+            record("application.eligibleCost", json!(1e308)),
+        ];
+        assert_eq!(result_state(&run(rule, evidence)), "review_required");
+    }
+
+    #[test]
     fn compare_rejects_invalid_terms_relations_and_scope() {
         for (key, value) in [
             ("factor", json!(0)),
             ("factor", json!(-1)),
-            ("factor", json!(1e8)),
             ("factor", Value::Null),
             ("field", json!("entity.kind")),
             ("extra", json!(true)),
@@ -1297,6 +1335,14 @@ mod tests {
             result_state(&run(
                 rule.clone(),
                 vec![record("application.eventStart", json!("2026-11-04"))]
+            )),
+            "fail"
+        );
+        rule["days"] = json!(u64::MAX);
+        assert_eq!(
+            result_state(&run(
+                rule.clone(),
+                vec![record("application.eventStart", json!("2026-11-05"))]
             )),
             "fail"
         );

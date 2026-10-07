@@ -105,6 +105,9 @@ impl Mock {
                         extraction["citations"][0]["quote"] =
                             json!("Students in the specified degree courses may apply.");
                     }
+                    if mode == "large_response" {
+                        extraction["summary"] = json!("x".repeat(8 * 1024 * 1024 + 1));
+                    }
                     let mut response = json!({"id":"gen-mock","model":MODEL,"provider":"OpenAI","choices":[{"finish_reason":"stop","message":{"content":extraction.to_string()}}],"usage":{"prompt_tokens":1000,"completion_tokens":200,"completion_tokens_details":{"reasoning_tokens":150},"cost":0.002}});
                     if mode == "unknown_cost" {
                         response["usage"].as_object_mut().unwrap().remove("cost");
@@ -186,7 +189,6 @@ impl Mock {
             http: http(),
             endpoint: format!("{}/chat", self.base),
             api_key: None,
-            max_tokens: 32768,
         }
     }
 }
@@ -212,8 +214,6 @@ fn options(temp: &TempDir, limit: usize) -> RunOptions {
         allow_localhost: true,
         retry_failed: false,
         dry_run: false,
-        max_file_bytes: 1024 * 1024,
-        max_notice_bytes: 2 * 1024 * 1024,
     }
 }
 fn db(temp: &TempDir) -> Store {
@@ -250,6 +250,10 @@ fn limit_cache_native_bytes_and_complete_changed_version() {
     let request = &mock.requests.lock().unwrap()[0].clone();
     assert_eq!(request["plugins"][0]["pdf"]["engine"], "native");
     assert_eq!(request["reasoning"]["effort"], "max");
+    for key in ["max_tokens", "max_completion_tokens", "max_output_tokens"] {
+        assert!(request.get(key).is_none(), "unexpected {key}");
+        assert!(request["reasoning"].get(key).is_none());
+    }
     assert_eq!(request["provider"]["allow_fallbacks"], false);
     assert_eq!(request["response_format"]["json_schema"]["strict"], true);
     let instruction = request["messages"][0]["content"][0]["text"]
@@ -975,4 +979,84 @@ fn malformed_or_nonobject_provider_error_never_panics_and_retains_raw_bytes() {
         assert_eq!(saved["_raw_response"], raw);
         assert_eq!(saved["_http_status"], 429);
     }
+}
+
+#[test]
+fn complete_large_input_and_response_are_not_cut_off_by_application_caps() {
+    let mock = Mock::new();
+    let temp = TempDir::new().unwrap();
+    let mut store = db(&temp);
+    let files: Vec<_> = (0..21).map(|i| format!("/file{i}")).collect();
+    for file in &files {
+        mock.put(file, b"%PDF-1.4 Original");
+    }
+    let files: Vec<_> = files.iter().map(String::as_str).collect();
+    let mut notice = mock.notice(&"n".repeat(301), &files);
+    notice.source_text = Some("s".repeat(2 * 1024 * 1024 + 1));
+    *mock.response_mode.lock().unwrap() = "large_response".into();
+    let summary = pipeline::run(
+        &mut store,
+        &http(),
+        Some(&mock.model()),
+        vec![notice.clone()],
+        &options(&temp, 1),
+    )
+    .unwrap();
+    assert_eq!(
+        (summary.calls, summary.extracted, summary.failed),
+        (1, 1, 0)
+    );
+    let requests = mock.requests.lock().unwrap();
+    let parts = requests[0]["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(parts.len(), 22);
+    let input: Value = serde_json::from_str(
+        parts[0]["text"]
+            .as_str()
+            .unwrap()
+            .split("INPUT DATA:\n")
+            .nth(1)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(input["source_content"], notice.source_text.unwrap());
+    let saved = store.latest_notices().unwrap();
+    assert_eq!(
+        saved[0]["extraction"]["summary"].as_str().unwrap().len(),
+        8 * 1024 * 1024 + 1
+    );
+}
+
+#[test]
+fn limit_three_counts_provider_failures_and_cache_never_adds_calls() {
+    let mock = Mock::new();
+    let temp = TempDir::new().unwrap();
+    let mut store = db(&temp);
+    *mock.response_mode.lock().unwrap() = "truncated".into();
+    let notices: Vec<_> = (0..4).map(|i| mock.notice(&format!("n{i}"), &[])).collect();
+    let first = pipeline::run(
+        &mut store,
+        &http(),
+        Some(&mock.model()),
+        notices.clone(),
+        &options(&temp, 3),
+    )
+    .unwrap();
+    assert_eq!(
+        (first.processed, first.calls, first.needs_review),
+        (3, 3, 3)
+    );
+    assert_eq!(mock.requests.lock().unwrap().len(), 3);
+    let cached = pipeline::run(
+        &mut store,
+        &http(),
+        Some(&mock.model()),
+        notices[..3].to_vec(),
+        &options(&temp, 3),
+    )
+    .unwrap();
+    assert_eq!(
+        (cached.unchanged, cached.processed, cached.calls),
+        (3, 0, 0)
+    );
+    assert_eq!(mock.requests.lock().unwrap().len(), 3);
 }
