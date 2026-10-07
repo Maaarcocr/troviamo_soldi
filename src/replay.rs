@@ -130,12 +130,17 @@ fn diagnose(row: &Value) -> Value {
             format!("Preserved raw provider response is not valid unambiguous JSON: {error:#}"),
         );
     }
-    if let Some(reason) = provider_problem(&response) {
-        return failure(row, "provider_error", "provider_envelope", reason);
-    }
-    let content = response["choices"][0]["message"]["content"]
-        .as_str()
-        .unwrap();
+    let content = match model::response_content(&response) {
+        Ok(content) => content,
+        Err(error) => {
+            return failure(
+                row,
+                "provider_error",
+                "provider_envelope",
+                format!("{error:#}"),
+            );
+        }
+    };
     let extraction_content = match model::parse_json(content) {
         Ok(extraction) => extraction,
         Err(error) => {
@@ -268,49 +273,6 @@ fn reported_content(extraction: &Value) -> Value {
         "manual_clauses": manual,
         "note": "Reported clauses and unknowns are diagnostic only, including when structural_validation fails. Nothing is repaired, imported, or treated as verified eligibility."
     })
-}
-
-/// Keep the same envelope restrictions as model::parse_saved_response. Splitting them
-/// here prevents provider/truncation failures from being called contract failures.
-fn provider_problem(response: &Value) -> Option<String> {
-    if !response.is_object() {
-        return Some("Saved provider response must be an object.".into());
-    }
-    if response.get("error").is_some() || response.get("_http_status").is_some() {
-        return Some(format!(
-            "Provider returned an error (HTTP status: {}). Inspect the saved response; no retry was made.",
-            response
-                .get("_http_status")
-                .map(Value::to_string)
-                .unwrap_or_else(|| "not recorded".into())
-        ));
-    }
-    if response["model"].as_str() != Some(model::MODEL) {
-        return Some("Unexpected or missing response model.".into());
-    }
-    let choice = &response["choices"][0];
-    if choice["finish_reason"] != "stop" {
-        return Some(format!(
-            "Incomplete model output: finish_reason must be stop (saved: {}).",
-            choice["finish_reason"]
-        ));
-    }
-    let message = &choice["message"];
-    if !message["refusal"].is_null() {
-        return Some("Model refused the request.".into());
-    }
-    if message["annotations"]
-        .as_array()
-        .is_some_and(|a| a.iter().any(|x| x["type"] == "file"))
-    {
-        return Some(
-            "Unexpected parsed-file annotation; native-only processing requires review.".into(),
-        );
-    }
-    if !message["content"].is_string() {
-        return Some("Model content is absent or not a string.".into());
-    }
-    None
 }
 
 fn input_sources(row: &Value) -> Result<Vec<String>> {

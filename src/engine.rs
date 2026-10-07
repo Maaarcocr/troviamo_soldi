@@ -61,26 +61,24 @@ fn closed_object<'a>(
     );
     Ok(object)
 }
+fn has_unsafe_controls(value: &str) -> bool {
+    value
+        .chars()
+        .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+}
 fn text<'a>(value: &'a Value, name: &str, min: usize, max: usize) -> Result<&'a str> {
     let value = value
         .as_str()
         .with_context(|| format!("{name} must be a string"))?;
     let length = value.trim().chars().count();
     ensure!(
-        length >= min && length <= max && !value.contains('\0'),
+        length >= min && length <= max && !has_unsafe_controls(value),
         "{name} has invalid length/content"
     );
     Ok(value)
 }
 fn identifier<'a>(value: &'a Value, name: &str) -> Result<&'a str> {
-    let value = text(value, name, 1, 160)?;
-    ensure!(
-        value
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || b"_.:-".contains(&c)),
-        "{name} must be an ASCII identifier"
-    );
-    Ok(value)
+    text(value, name, 1, 160)
 }
 fn enumeration<'a>(value: &'a Value, options: &[&str], name: &str) -> Result<&'a str> {
     let value = value
@@ -129,7 +127,7 @@ fn valid_value(value: &Value, definition: &Value) -> bool {
             .as_array()
             .is_some_and(|options| options.iter().any(|option| option["value"] == *value)),
         Some("string") => value.as_str().is_some_and(|v| {
-            !v.trim().is_empty() && v.chars().count() <= 3000 && !v.contains('\0')
+            !v.trim().is_empty() && v.chars().count() <= 3000 && !has_unsafe_controls(v)
         }),
         _ => false,
     }
@@ -243,10 +241,7 @@ fn validate_extraction_inner(
     let citations = value["citations"]
         .as_array()
         .context("citations must be an array")?;
-    ensure!(
-        !citations.is_empty() && citations.len() <= 300,
-        "Expected 1–300 citations"
-    );
+    ensure!(citations.len() <= 300, "Too many citations");
     let mut citation_ids = HashSet::new();
     for citation in citations {
         closed_object(
@@ -266,8 +261,10 @@ fn validate_extraction_inner(
             allowed_sources.is_none_or(|sources| sources.iter().any(|allowed| allowed == source)),
             "Citation source is outside the supplied official source list: {source}"
         );
-        text(&citation["locator"], "citation locator", 1, 1000)?;
-        text(&citation["quote"], "citation quote", 8, 10_000)?;
+        if !citation["locator"].is_null() {
+            text(&citation["locator"], "citation locator", 1, 1000)?;
+        }
+        text(&citation["quote"], "citation quote", 1, 10_000)?;
     }
     let requirements = value["requirements"]
         .as_array()
@@ -313,12 +310,11 @@ fn validate_extraction_inner(
                 !references.is_empty() && references.len() <= 30,
                 "Each requirement needs 1–30 citations"
             );
-            let mut seen = HashSet::new();
             for reference in references {
                 let reference = reference.as_str().context("Citation id must be a string")?;
                 ensure!(
-                    citation_ids.contains(reference) && seen.insert(reference),
-                    "Missing or duplicate citation reference: {reference}"
+                    citation_ids.contains(reference),
+                    "Missing citation reference: {reference}"
                 );
             }
             if op == "manual" {
@@ -386,17 +382,12 @@ fn validate_extraction_inner(
                         let values = rule["values"]
                             .as_array()
                             .context("values must be an array")?;
-                        ensure!(
-                            !values.is_empty() && values.len() <= 100,
-                            "one_of requires 1–100 values"
-                        );
-                        let mut unique = HashSet::new();
+                        ensure!(!values.is_empty(), "one_of requires at least one value");
                         for value in values {
                             ensure!(
                                 valid_value(value, definition),
                                 "one_of value does not match its field type"
                             );
-                            ensure!(unique.insert(value.to_string()), "Duplicate one_of value");
                         }
                     }
                     "range" => {
@@ -1158,7 +1149,7 @@ mod tests {
             candidate["citations"][0][key] = value;
             assert!(validate_extraction(&candidate, &sources()).is_err());
         }
-        for references in [json!([]), json!(["absent"]), json!(["c1", "c1"])] {
+        for references in [json!([]), json!(["absent"])] {
             let mut candidate = base.clone();
             candidate["requirements"][0]["citation_ids"] = references;
             assert!(validate_extraction(&candidate, &sources()).is_err());

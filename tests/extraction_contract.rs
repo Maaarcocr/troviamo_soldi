@@ -294,27 +294,48 @@ fn region_names_are_canonical_and_aliases_never_cause_false_exclusion() {
     assert_eq!(evaluate(&call)["state"], "screening_match");
 }
 #[test]
-fn identifier_schema_declares_the_same_ascii_syntax_as_validation() {
+fn identifiers_allow_unicode_and_spaces_without_changing_reference_identity() {
     let schema = engine::extraction_schema();
     let variants = schema["properties"]["requirements"]["items"]["anyOf"]
         .as_array()
         .unwrap();
     for variant in variants {
-        assert_eq!(variant["properties"]["id"]["pattern"], "^[A-Za-z0-9_.:-]+$");
-        assert_eq!(
-            variant["properties"]["citation_ids"]["items"]["pattern"],
-            "^[A-Za-z0-9_.:-]+$"
+        assert!(variant["properties"]["id"].get("pattern").is_none());
+        assert!(
+            variant["properties"]["citation_ids"]["items"]
+                .get("pattern")
+                .is_none()
         );
+        assert_eq!(variant["properties"]["id"]["type"], "string");
     }
-    assert_eq!(
-        schema["properties"]["citations"]["items"]["properties"]["id"]["pattern"],
-        "^[A-Za-z0-9_.:-]+$"
+    assert!(
+        schema["properties"]["citations"]["items"]["properties"]["id"]
+            .get("pattern")
+            .is_none()
     );
-    for invalid in ["requisito 1", "città"] {
-        let mut call = startup();
-        call["requirements"][0]["id"] = json!(invalid);
-        assert!(engine::validate_extraction(&call, &sources()).is_err());
+    let mut call = facts(extraction(vec![condition(
+        "requisito città 1",
+        "entity.country",
+        json!("IT"),
+    )]));
+    call["citations"][0]["id"] = json!("fonte città 1");
+    call["requirements"][0]["citation_ids"] = json!(["fonte città 1"]);
+    engine::validate_extraction(&call, &sources()).unwrap();
+    assert_eq!(evaluate(&call)["state"], "screening_match");
+    for invalid in [json!(""), json!(" \t\r\n"), json!(false), Value::Null] {
+        let mut bad = call.clone();
+        bad["requirements"][0]["id"] = invalid;
+        assert!(engine::validate_extraction(&bad, &sources()).is_err());
     }
+    let mut mismatched = call.clone();
+    mismatched["requirements"][0]["citation_ids"] = json!(["fonte citta 1"]);
+    assert!(engine::validate_extraction(&mismatched, &sources()).is_err());
+    let mut duplicate_rule = call.clone();
+    duplicate_rule["requirements"] = json!([call["requirements"][0], call["requirements"][0]]);
+    assert!(engine::validate_extraction(&duplicate_rule, &sources()).is_err());
+    let duplicate = call["citations"][0].clone();
+    call["citations"].as_array_mut().unwrap().push(duplicate);
+    assert!(engine::validate_extraction(&call, &sources()).is_err());
 }
 #[test]
 fn new_responses_require_v3_while_replay_can_read_unchanged_legacy() {
@@ -426,4 +447,175 @@ fn factual_contract_has_no_model_global_review_verdict() {
         call[key] = json!([]);
         assert!(engine::validate_extraction(&call, &sources()).is_err());
     }
+}
+
+#[test]
+fn short_literal_numeric_quotes_are_accepted_without_padding_or_rewriting() {
+    let schema = engine::extraction_schema();
+    assert_eq!(
+        schema["properties"]["citations"]["items"]["properties"]["quote"]["minLength"],
+        1
+    );
+    for amount in [120000, 30500, 1080000, 0] {
+        let mut call = facts(extraction(vec![json!({
+            "id":"massimo", "label":"Costo massimo", "op":"range",
+            "field":"project.totalCost", "min":null, "max":amount, "citation_ids":["c1"]
+        })]));
+        call["citations"][0]["quote"] = json!(amount.to_string());
+        let response = json!({"model":model::MODEL,"choices":[{
+            "finish_reason":"stop","message":{"content":call.to_string()}
+        }]});
+        assert_eq!(model::parse_response(&response, &sources()).unwrap(), call);
+    }
+    for invalid in [json!(""), json!(" \t\r\n"), json!(120000), Value::Null] {
+        let mut call = facts(startup());
+        call["citations"][0]["quote"] = invalid;
+        assert!(engine::validate_extraction(&call, &sources()).is_err());
+    }
+}
+
+#[test]
+fn no_extracted_requirements_need_no_invented_citations_and_stay_under_review() {
+    let schema = engine::extraction_schema();
+    assert!(schema["properties"]["citations"].get("minItems").is_none());
+    let mut call = facts(extraction(vec![]));
+    call["citations"] = json!([]);
+    call["status"] = json!("unknown");
+    call["opens_on"] = Value::Null;
+    call["closes_at"] = Value::Null;
+    engine::validate_extraction(&call, &sources()).unwrap();
+    let result = evaluate(&call);
+    assert_eq!(result["state"], "review_required");
+    assert_eq!(result["visible"], true);
+    assert!(!result["review_reasons"].as_array().unwrap().is_empty());
+
+    call["requirements"] = json!([condition("country", "entity.country", json!("IT"))]);
+    assert!(engine::validate_extraction(&call, &sources()).is_err());
+    call["requirements"][0]["citation_ids"] = json!([]);
+    assert!(engine::validate_extraction(&call, &sources()).is_err());
+}
+
+#[test]
+fn an_unknown_locator_is_null_but_a_present_locator_must_be_nonempty_text() {
+    let schema = engine::extraction_schema();
+    assert_eq!(
+        schema["properties"]["citations"]["items"]["properties"]["locator"]["type"],
+        json!(["string", "null"])
+    );
+    let mut call = facts(startup());
+    call["citations"][0]["locator"] = Value::Null;
+    engine::validate_extraction(&call, &sources()).unwrap();
+    assert_eq!(evaluate(&call)["state"], "excluded");
+    for invalid in [json!(""), json!(" \t\r\n"), json!(12), json!(false)] {
+        call["citations"][0]["locator"] = invalid;
+        assert!(engine::validate_extraction(&call, &sources()).is_err());
+    }
+}
+
+#[test]
+fn broad_country_lists_and_repeated_set_members_preserve_their_meaning() {
+    let mut values = engine::fields()["entity.country"]["canonical_values"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(values.len() > 100);
+    values.push(json!("IT"));
+    let mut call = facts(extraction(vec![json!({
+        "id":"countries", "label":"Paesi", "op":"one_of", "field":"entity.country",
+        "values":values, "citation_ids":["c1", "c1"]
+    })]));
+    engine::validate_extraction(&call, &sources()).unwrap();
+    assert_eq!(evaluate(&call)["state"], "screening_match");
+    let schema = engine::extraction_schema();
+    for variant in schema["properties"]["requirements"]["items"]["anyOf"]
+        .as_array()
+        .unwrap()
+    {
+        if variant["properties"]["op"]["enum"] == json!(["one_of"]) {
+            assert_eq!(variant["properties"]["values"]["minItems"], 1);
+            assert!(variant["properties"]["values"].get("maxItems").is_none());
+        }
+    }
+    for invalid in [json!([]), json!(["IT", false]), json!(["IT", "ZZ"])] {
+        call["requirements"][0]["values"] = invalid;
+        assert!(engine::validate_extraction(&call, &sources()).is_err());
+    }
+}
+
+#[test]
+fn text_controls_are_rejected_without_cleaning_and_source_whitespace_is_preserved() {
+    let base = facts(extraction(vec![json!({
+        "id":"manual", "label":"Requisito", "op":"manual",
+        "note":"Condizione da verificare", "citation_ids":["c1"]
+    })]));
+    for control in [
+        '\0', '\u{1}', '\u{b}', '\u{c}', '\u{1b}', '\u{7f}', '\u{85}', '\u{9b}',
+    ] {
+        let unsafe_text = json!(format!("Testo{control}fonte"));
+        for pointer in [
+            "/title",
+            "/summary",
+            "/requirements/0/id",
+            "/requirements/0/label",
+            "/requirements/0/note",
+            "/citations/0/locator",
+            "/citations/0/quote",
+        ] {
+            let mut call = base.clone();
+            *call.pointer_mut(pointer).unwrap() = unsafe_text.clone();
+            let unchanged = call.clone();
+            assert!(
+                engine::validate_extraction(&call, &sources()).is_err(),
+                "{pointer}"
+            );
+            assert_eq!(call, unchanged);
+        }
+        let mut call = base.clone();
+        call["citations"][0]["id"] = unsafe_text.clone();
+        call["requirements"][0]["citation_ids"] = json!([unsafe_text]);
+        assert!(engine::validate_extraction(&call, &sources()).is_err());
+    }
+    let mut call = base;
+    call["citations"][0]["quote"] = json!(" \t120000\r\n");
+    call["citations"][0]["locator"] = json!("Tabella\t1\r\nImporti");
+    let response = json!({"model":model::MODEL,"choices":[{
+        "finish_reason":"stop","message":{"content":call.to_string()}
+    }]});
+    assert_eq!(model::parse_response(&response, &sources()).unwrap(), call);
+}
+
+#[test]
+fn missing_boolean_evidence_stays_unknown_while_explicit_false_fails() {
+    let call = facts(extraction(vec![condition(
+        "ownership",
+        "project.publicOwnership",
+        json!(true),
+    )]));
+    let evaluate = |evidence: &[Value]| {
+        engine::evaluate_for_call(
+            &call,
+            &municipality(),
+            evidence,
+            Some("p1"),
+            Some("example"),
+            "2026-10-06T12:00:00Z",
+        )
+    };
+    assert_eq!(evaluate(&[])["results"][0]["state"], "unknown");
+    let mut record = json!({
+        "id":"ownership", "municipalityId":"081001", "projectId":"p1", "callId":null,
+        "field":"project.publicOwnership", "value":false, "provenance":"official",
+        "observedAt":"2026-10-06", "validUntil":null, "source":{"title":"Atto di proprietà"}
+    });
+    assert_eq!(evaluate(&[record.clone()])["results"][0]["state"], "fail");
+    record["value"] = Value::Null;
+    assert_eq!(
+        evaluate(&[record.clone()])["results"][0]["state"],
+        "unknown"
+    );
+    record["value"] = json!("false");
+    assert_eq!(evaluate(&[record])["results"][0]["state"], "unknown");
+    let mut invalid = call;
+    invalid["requirements"][0]["value"] = json!("true");
+    assert!(engine::validate_extraction(&invalid, &sources()).is_err());
 }

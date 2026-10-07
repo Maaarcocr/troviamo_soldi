@@ -315,8 +315,10 @@ fn evaluate_notice(
     project: Option<&str>,
     as_of: &str,
 ) -> Value {
-    let extraction_ready = matches!(text(&notice, "state"), "screened" | "needs_review")
-        && notice["extraction"].is_object();
+    let extraction_ready = matches!(
+        text(&notice, "state"),
+        "extracted" | "screened" | "needs_review"
+    ) && notice["extraction"].is_object();
     let mut evaluation = if extraction_ready {
         if let Some(municipality) = municipality {
             engine::evaluate_for_call(
@@ -582,9 +584,12 @@ fn render_notice(out: &mut String, notice: &Value) {
         for citation in citations {
             let _ = write!(
                 out,
-                "<li><p>{} · {}</p><blockquote>{}</blockquote><span class=\"quiet\">Riferimento: {}</span></li>",
+                "<li><p>{}{}</p><blockquote>{}</blockquote><span class=\"quiet\">Riferimento: {}</span></li>",
                 source_link(text(citation, "source_url"), "Documento originale ↗"),
-                escape(text(citation, "locator")),
+                citation["locator"]
+                    .as_str()
+                    .map(|locator| format!(" · {}", escape(locator)))
+                    .unwrap_or_default(),
                 escape(text(citation, "quote")),
                 escape(text(citation, "id"))
             );
@@ -938,6 +943,30 @@ mod tests {
         assert!(!response.body.contains("<script"));
         assert!(!response.body.contains("OPENROUTER_API_KEY"));
         assert!(response.body.contains("Non è un catalogo completo"));
+    }
+
+    #[test]
+    fn extracted_and_legacy_rows_render_without_invented_citation_locators() {
+        let mut extraction: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/extraction.json")).unwrap();
+        extraction["citations"][0]["locator"] = Value::Null;
+        extraction["citations"][0]["quote"] = json!("Comuni");
+        let municipality =
+            json!({"istatCode":"088001","region":"Sicilia","registryReferenceDate":"2026-10-06"});
+        for state in ["extracted", "screened"] {
+            let result = evaluate_notice(
+                json!({"id":"call","state":state,"updated_at":"2026-10-06T12:00:00Z","extraction":extraction}),
+                Some(&municipality),
+                &[],
+                None,
+                "2026-10-06T12:00:00Z",
+            );
+            assert_eq!(result["evaluation"]["state"], "screening_match");
+            let mut html = String::new();
+            render_notice(&mut html, &result);
+            assert!(html.contains("<blockquote>Comuni</blockquote>"));
+            assert!(!html.contains("Documento originale ↗</a> ·"));
+        }
     }
 
     #[test]

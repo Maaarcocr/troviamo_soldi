@@ -175,7 +175,7 @@ fn parse_eu_notice(result: &Value) -> Result<Notice> {
     let source_url = allowed_url(required_str(result, "url")?, None, EU_HOSTS)?;
     let mut documents = Vec::new();
     let mut sections = vec![format!(
-        "SEDIA opportunity record: {reference}\nOpportunity ID: {id}\nOpportunity title: {title}\nFunding type: {funding_type} (SEDIA type code {kind})\nSource: {source_url}\nSource status: {status} ({status_label}; SEDIA status code {status_code})\nReference-code labels: {EU_FACET_API}\nStatus describes the supplied source snapshot, not perpetual current availability or applicant eligibility. Source dates and narratives remain separate evidence; unresolved conflicts must not be silently overwritten by this status."
+        "SEDIA opportunity record: {reference}\nOpportunity ID: {id}\nOpportunity title: {title}\nFunding type: {funding_type} (SEDIA type code {kind})\nSource: {source_url}\nSource status: {status} ({status_label}; SEDIA status code {status_code})\nReference-code labels: {EU_FACET_API}"
     )];
     // Do not hide a contradictory or unrecognised additional status value if
     // the source supplies more than one; all raw values retain their meaning.
@@ -188,11 +188,8 @@ fn parse_eu_notice(result: &Value) -> Result<Notice> {
             None => "unknown (unrecognised source code; no mapping inferred)".into(),
         };
         sections.push(format!(
-            "Additional source status: {explanation}; SEDIA status code {other_code}. Multiple differing source statuses require review."
+            "Additional source status: {explanation}; SEDIA status code {other_code}"
         ));
-    }
-    if kind == "8" {
-        sections.push("Cascade identity: the opportunity is the child call identified by this record reference and callTitle. The metadata title and identifier describe its parent grant topic; projectName/projectId describe its parent project. Parent context does not itself establish the child call's applicant requirements.".into());
     }
     // Keep both authoritative structured dates and narratives; discrepancies
     // require later review rather than silently discarding the older deadline.
@@ -307,9 +304,7 @@ fn eu_field_label<'a>(kind: &str, field: &'a str) -> &'a str {
         (_, "frameworkProgramme") => {
             "Funding programme reference code (metadata.frameworkProgramme)"
         }
-        (_, "esDA_IngestDate") => {
-            "Source index snapshot timestamp (metadata.esDA_IngestDate; not a current availability guarantee)"
-        }
+        (_, "esDA_IngestDate") => "Source index snapshot timestamp (metadata.esDA_IngestDate)",
         (_, "closingDate") => {
             "Source closingDate metadata (preserved independently of deadlineDate)"
         }
@@ -827,7 +822,9 @@ mod tests {
             )));
             assert!(!text.contains(&format!("status:\n{code}")));
             assert!(text.contains(EU_FACET_API));
-            assert!(text.contains("supplied source snapshot, not perpetual current availability"));
+            assert!(!text.contains("require review"));
+            assert!(!text.contains("must not"));
+            assert!(!text.contains("Cascade identity:"));
             assert!(text.contains("Source index snapshot timestamp"));
             assert!(text.contains("2026-09-28T10:00:00.000+0000"));
         }

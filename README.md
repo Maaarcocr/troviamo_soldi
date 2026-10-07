@@ -1,14 +1,17 @@
 # troviamo_soldi
 
-Comuni / bandi, in Rust
+One Rust binary, SQLite, and a read-only Italian web UI for screening funding calls against Sicilian municipalities.
 
-One binary. SQLite. Original files go to Luna. No PDF extraction, OCR, agents, Python, workflow service, or JavaScript frontend.
+1. Discover notices and download their original files.
+2. Skip a notice if its source content and file hashes are unchanged.
+3. For a new or changed notice, send the current text and all supported originals to OpenRouter `openai/gpt-6-luna`, with max reasoning and strict JSON. Make one request at most.
+4. Save the facts and actual reported cost. Rust filters municipalities locally, without another AI call.
 
-The daily command discovers notices, hashes their original attachments, processes only new/changed versions with `openai/gpt-6-luna` at `reasoning.effort=max`, validates the returned factual conditions, and saves usage. The same binary serves a small read-only Italian interface. Municipality/project changes are evaluated locally and make **no AI calls**.
+No OCR, PDF text extraction, classifier stage, model eligibility verdict, larger-model fallback, or automatic paid retry. A changed notice is self-contained: previous model output is never fed back as evidence.
 
-## Run locally
+## Run
 
-Install current stable Rust, then:
+Install stable Rust, then:
 
 ```sh
 cargo build --release --locked
@@ -16,121 +19,114 @@ cargo build --release --locked
 ./target/release/funding-rust serve
 ```
 
-Open http://127.0.0.1:8080. The initial archive is empty, with the 391 Sicilian municipalities and 511 previously collected official evidence records bundled. No example funding claims are loaded as real opportunities.
+Open http://127.0.0.1:8080. The initial archive is empty. The app bundles 391 Sicilian municipalities and 511 previously collected official evidence records; it does not load example grants as real opportunities.
 
 ```sh
-# Free source discovery, without AI or attachment processing:
+# Discover source content, without AI calls:
 ./target/release/funding-rust discover --out notices.json
 
-# Fetch/hash up to 5 new/changed candidates; no AI requests:
+# Download/hash at most 5 new or changed notices, without AI calls:
 ./target/release/funding-rust run --limit 5 --dry-run
 
-# Billable only after YOU configure OPENROUTER_API_KEY and a provider budget:
+# After configuring OPENROUTER_API_KEY and an OpenRouter spending limit:
 ./target/release/funding-rust run --limit 5 --allow-paid
 
-# Reuse a saved/manual notice array, skipping live discovery:
+# Use a populated discovery export or manual input instead:
 ./target/release/funding-rust run --input notices.json --limit 5 --allow-paid
 
 ./target/release/funding-rust status
 ```
 
-`daily` is an alias of `run`. The limit is mandatory and counts **bandi attempted**, including download failures, provider failures and review cases. Unchanged cached versions do not consume a slot. Each attempted bando makes at most one model request in that run. There is no automatic larger-model fallback or paid retry.
+`daily` is an alias of `run`. `--limit` is mandatory and counts attempted **bandi**, including input/download/provider failures and review cases. Unchanged cached versions consume no slot and make no model call. Every attempted notice makes at most one model request. A writer lock prevents overlapping CLI runs.
 
-A timeout may have been billed upstream. Its outcome is stored as uncertain/failed and unchanged versions are not automatically retried. `--retry-failed` is an explicit operator choice that can duplicate uncertain charges. It also retries review cases. The SQLite writer lock prevents overlapping CLI runs; an interrupted in-flight attempt remains visible for review.
+The limit caps notices, **not money**. `--max-tokens` defaults to 32,768 for reasoning plus visible JSON. Truncated output is saved for inspection, not retried. A timeout or interrupted request may have been billed: `--retry-failed` explicitly retries failed, interrupted or review versions and can duplicate charges. Do not use it merely to inspect a failure.
 
-The limit caps notices, **not money**. Max-effort reasoning and the size of originals affect cost. `--max-tokens` defaults to 32,768 for reasoning and visible JSON combined; a truncated response is retained for review, not silently retried or treated as a success. Set an OpenRouter spending limit before real runs. No paid model request was used to develop/test this project.
+## Source input
 
-## Input and evidence
+Configure adapters and download hosts in `config/sources.json`; `examples/notices.json` shows the manual notice format.
 
-`examples/notices.json` documents the notice format. Use `config/sources.json` to enable adapters or add explicit manual feeds. `allowed_hosts` limits original-file fetches, including redirect targets. Production sources must be HTTPS; local HTTP is allowed only with the test-only loopback `--mock-url` option. Files are bounded by application-configured size limits (25 MiB/file, 50 MiB/notice by default, maximum 20 files); these are **not provider guarantees**.
+Each notice needs nonblank `source_text` or original documents. A bare ID/title/URL is not sufficient and is rejected before a model call. Use the populated `discover` export, paste the actual source text/HTML/JSON, or supply the original file URLs. The app does not fetch a bare URL and assume a portal shell contains the call. Supplied HTML is accepted without language, length or JavaScript-content guessing.
 
-Documents are downloaded as original bytes, SHA-256 hashed and stored under `var/files/<hash>`. PDFs and PNG/JPEG/WebP/GIF are sent as base64 original bytes. Unsupported files such as DOCX, ZIP or P7M are cached and listed as a coverage gap; they are not unpacked, converted or sent through an OCR fallback. Their presence deterministically forces `needs_review`. A download failure, excess size, or HTML response instead of an attachment stops that notice before a model call.
+Original bytes are SHA-256 hashed and cached under `var/files/<hash>`. PDFs and PNG/JPEG/WebP/GIF are sent directly as base64 originals. DOCX, ZIP, P7M and other unsupported files are retained as coverage gaps; they are not unpacked, converted or OCRed. If there is no source text and every file is unsupported, processing stops before a paid request. With usable input plus unsupported files, extraction can proceed but remains under review.
 
-For an amendment, only changed files are sent with the previous structured extraction and complete current file manifest. If no valid prior extraction exists, all supported files are sent. The prompt asks to retain supported prior facts. Rust flags removed or unsupported originals; unresolved individual conditions remain manual. This is cheaper than resending originals but is not independent verification of the prior interpretation. Changes to source content or attachment lists also create versions. Reappearing identical versions reuse their own cached result.
+Downloads require an allowed HTTPS host, including redirect targets. Limits are 25 MiB/file, 50 MiB/notice and 20 files by default; these are application limits, not provider guarantees. Download failure, oversize content or HTML returned as an attachment stops the notice before a model request. Loopback HTTP is only for the test `--mock-url` path.
 
-Without attachments, real source HTML/text/JSON is sent as text input. No pretend PDF is made. There is no OCR or local PDF parsing at any stage.
+The request includes the current `as_of` time for interpreting dated windows. Time alone does not change the source fingerprint or trigger another call.
 
-```sh
-# Local facts import; no AI call, no external transmission:
-./target/release/funding-rust import-facts examples/facts.json
-```
+Changed notice text, titles or attachments produce a new fingerprint. All current supported originals are then sent again. Removed originals are flagged for review. This can use more input tokens than sending only an amendment, but avoids carrying a previous model interpretation forward. Identical historical versions reuse their own cached result.
 
-Facts are scoped to ISTAT municipality, project and, for application-specific facts, call ID. Imports are always marked `user_declared`, even if the JSON claims `official`; they cannot overwrite bundled official evidence. Registry fields are read-only. The UI is deliberately read-only; edit a local facts JSON and import again to update declarations.
+### Coverage
 
-The generic six-operator evaluator uses `data/fields.json`. It does not branch on specific municipality or bando names. Unknown, contradictory, stale, historical and self-declared evidence cannot become verified eligibility. In particular, a population estimate cannot silently satisfy legal-population/reference-date conditions, and historical financial lists do not prove a current ordinary financial status.
+- EU SEDIA: current official index, English open/forthcoming records, types 1/2/8. Child cascade calls keep their own IDs and are labelled separately from parent topics/projects. Status/type codes are decoded from the official FACET API. Conflicting source dates and narratives are retained.
+- EuroInfoSicilia: audited Bandi category union, including closed results/amendments. Article HTML is checked because WordPress bodies can omit attachment links.
+- National sources: explicit/manual feed additions.
 
-## Coverage and interpretation limits
+This is not a complete all-Italy or all-EU catalogue. External cascade sites are not recursively crawled. External annex hosts outside the configured allowlist are not fetched; some real annexes therefore remain outside coverage. Source errors fail discovery rather than silently claim a complete refresh. A small AI limit still requires configured source discovery. Absence from a listing does not close a call, and an article can contain more than one opportunity.
 
-- EU SEDIA: official current index, English open/forthcoming records, types 1/2/8. Topic IDs remain distinct; cascade records keep their own IDs. The prompt receives decoded status/type labels and distinct child-call versus parent-topic/project identities. Status labels were verified against the official SEDIA FACET API; “Open for submission” is a source snapshot observation, not proof of present eligibility. Structured deadlines, closing dates and narrative duration/windows remain separate when they disagree. External cascade sites are not recursively crawled.
-- EuroInfoSicilia: audited Bandi category union, including closed results/amendments; article HTML is inspected because WordPress bodies can omit attachment links. It is not every Regione department or all 5,116 regional posts.
-- National sources: simple explicit/manual feed additions. No claim of an all-Italy or all-EU complete funding catalogue.
-- A source article is not necessarily one unique funding opportunity. Multi-invitation articles and unsupported alternative legal routes must remain review cases. There is no automatic cross-source semantic merging.
-- Source/page/count errors fail discovery rather than silently advertise complete refreshes. Metadata or absence from a listing does not itself close an opportunity. Current configured discovery still costs network/time even with a small AI limit.
-- Conditions are a flat conjunction of validated `equals`, `one_of`, `range`, `compare`, `min_days`, and `manual` rules. Unsupported logic must be manual/review, not generated executable code.
-- Every requirement cites a supplied source URL. The prompt and request-specific JSON schema contain the same citation URL allowlist as Rust validation; links merely mentioned in source content are not separately supplied evidence. Quote/page text is **model-reported, not independently validated against PDFs**. Strict JSON is not proof of legal interpretation. Nothing here grants legal clearance.
-- Closed and ineligible records are hidden by default and available through the archive checkbox. Unsettled unknown/review cases stay visible; definite applicant mismatches stay excluded even when unrelated facts are unknown. Old or unavailable source checks need review; the web view does not fetch current documents.
+## Facts and municipality screening
 
-## Extraction contract and zero-cost diagnostics
-
-Luna extracts source facts; Rust decides applicability. Contract version 3 asks only for compact, cited facts, without a model-authored eligibility decision or global review verdict:
+Luna supplies compact source facts, not an eligibility decision. Descriptive budgets and scoring information belong in `summary`. `requirements` contains only mandatory applicant, project or application conditions.
 
 ```json
 {"id":"country","label":"Sede in Estonia","op":"one_of","field":"entity.country","values":["EE"],"citation_ids":["c1"]}
 ```
 
-An additional `entity.kind = startup` condition describes a startup-only call. Both conditions can be valid extractions even when an Italian municipality does not match. Country values are ISO alpha-2 codes; entity types and Italian regions use the catalogue's canonical identifiers (`Sicilia`, not `Sicily`). Broad public-body eligibility is `entity.publicBody = true`, not a narrower invented entity type. Other categories stay manual when they cannot be represented faithfully. Numeric financial fields are EUR; other currencies stay manual.
+Conditions are ANDed. The six operators are `equals`, `one_of`, `range`, `compare`, `min_days` and `manual`. Each structured condition must be necessary on its own; alternatives that cannot be expressed faithfully stay together in a manual condition. Rust derives evidence scope from the field catalogue; the model never supplies a scope or global blocker.
 
-- The model never supplies `scope` or `blocker`. Rust derives them from the evidence field. The legacy internal `municipality` scope means applicant-intrinsic information.
-- Each operator has only its own arguments. A manual clause has `id`, `label`, `op`, `note`, and `citation_ids`; it cannot carry a field or unused numeric arguments.
-- Conditions are ANDed; each structured condition must be necessary on its own. `one_of` allows alternative values of one field; other alternatives/uncertainty remain together in a manual condition. Missing nullable values stay `null`, and an unknown status stays `unknown`.
-- Unknown deadline/status and unrelated project/manual conditions remain individually unknown. They do not undo a clearly cited, definite applicant country/type mismatch. They do prevent a positive match when there is no settled exclusion.
-- `accepted` counts successfully extracted source facts without Rust-detected input coverage failures or an empty requirement list. It is **not** the number of eligible grants. CLI diagnostics print unresolved facts separately; local matching produces `excluded`, `ineligible`, `screening_match` or review states with reasons.
-- Existing SQLite tables, cached versions, raw provider responses and legacy extractions are retained. Legacy review outputs are not silently repaired or promoted. Invalid legacy records remain visible for review; an invalid prior extraction cannot suppress unchanged originals during an already-requested amendment analysis. New provider responses must use version 3. A small adapter keeps the existing version-2 SQLite extraction shape, adding only Rust-detected coverage/empty-result reasons. Original version-3 provider responses remain unchanged in the attempt log. Legacy shapes and their historical review flags are accepted only by the stored-data/replay path; they are never silently cleared. Duplicate JSON keys are rejected rather than allowing a later key to erase uncertainty. Merely upgrading does not issue paid calls or rewrite old results.
+Countries use ISO alpha-2 codes; applicant types and regions use the catalogue's identifiers. Broad public-body eligibility uses `entity.publicBody=true`. Financial numeric fields use EUR; unsupported currencies/categories remain manual. Unknown values stay unknown, never false or invented zeros.
 
-To diagnose saved attempts without spending again:
+Every requirement references supplied source citations. A quote can be a single literal value such as `30500`; it must be nonblank and free of unsafe controls. An unknown locator is `null`. An empty extraction may have no citations and remains under review. Duplicate JSON keys, invalid types, missing references and unsupported source URLs are rejected. Quotes are never padded, repaired or independently verified against PDFs. Valid JSON does not prove a correct interpretation.
+
+`extracted` means usable source facts were saved without an input-coverage failure or empty requirement list. It does **not** mean eligible grants. Unknown dates and individual manual conditions are reported separately. Rust's municipality matcher produces excluded, ineligible, screening-match or review results. Definite applicant mismatches can exclude a call despite unrelated unknown project facts; missing evidence never establishes a positive match.
+
+```sh
+# Local municipality/project facts, without AI calls:
+./target/release/funding-rust import-facts examples/facts.json
+```
+
+Imports are always `user_declared` and cannot overwrite bundled official evidence. Facts are scoped to municipality, project and, where needed, call ID. Historical, stale, contradictory or self-declared evidence cannot become verified eligibility. Population basis/reference dates and current financial status remain distinct from estimates and historical lists. The UI is read-only.
+
+## Inspect failures without spending again
 
 ```sh
 ./target/release/funding-rust --db var/funding.sqlite export-attempts --limit 10 --out attempts.json
 ./target/release/funding-rust replay attempts.json --out replay.json
 ```
 
-Export opens SQLite read-only. Replay reads only the JSON file; it does not open SQLite, discover sources, fetch originals, call a model or import recovered facts. Both commands refuse to overwrite an existing output file. Exports contain original response bytes as saved, source/version metadata and historical usage, so treat them as private diagnostic files.
+Export opens SQLite read-only. Replay reads only its input file: no database writes, downloads or model calls. Neither overwrites an existing output file. Exports contain original provider responses, source/version metadata and usage; keep them private.
 
-Reports distinguish provider failures/truncation, invalid JSON, contract errors and valid-but-unresolved facts. A bare SQL export with only `attempt_id`, `notice_id`, `response` and `validation_error` is accepted for syntax/provider diagnosis; without independent source metadata it reports structural errors and source-reported manual/review reasons separately and cannot validate citation URLs. Historical versions lacking their original notice-URL snapshot also remain diagnosis-only. No quotation is independently verified against original PDFs. Do not use `--retry-failed` to diagnose: that flag can spend money again.
+Replay separates provider failures, truncation, invalid JSON, invalid extraction and unresolved facts. Citation URL validation needs independent source metadata; a bare SQL export or historical record without its notice snapshot is diagnosis-only. No replay result verifies quotations or imports recovered facts.
 
-## Actual cost reporting
+Existing SQLite records, raw responses and review flags remain intact. Legacy extraction shapes are read through internal compatibility adapters. New model responses use version 3; a small storage adapter retains the existing version-2 shape for Rust coverage warnings. New successful rows use `extracted`; old `screened` rows remain readable. Upgrading does not itself issue calls, clean corrupted quotes or rewrite stored results. This release removes generated warning prose from SEDIA source text, so a later explicitly paid run can see affected EU records as changed and re-extract them, bounded by `--limit`. There is no uncapped migration or automatic re-extraction.
 
-Every response records provider generation ID, provider, returned usage and raw response in SQLite, including invalid/truncated responses. The CLI prints prompt, completion and reasoning tokens reported, the sum of returned `usage.cost` in USD, and mean actual cost per called/processed notice when all calls supplied cost. Completion tokens already include reasoning tokens; they are not added twice.
+## Actual cost
 
-Missing cost is **unknown**, never assumed zero. Any missing cost makes aggregate averages `null`, and the returned-cost sum is explicitly a partial subtotal. No forecast is substituted for actual charges. Returned generation IDs can be reconciled with OpenRouter's generation endpoint if needed; the app does not automatically retry or spend to recover them.
+Every response stores its generation ID, provider, raw response and reported usage, including invalid/truncated responses. Reports show prompt/completion/reasoning tokens, returned `usage.cost` in USD, and mean actual cost per called/processed notice when every call reports cost. Reasoning is already included in completion tokens and is not added twice.
 
-## HTTP and storage
+Missing cost is unknown, never zero. Any missing cost makes averages `null` and labels the returned-cost sum a partial subtotal. No price-table estimate replaces actual charges. Saved generation IDs can be reconciled with OpenRouter; the app does not automatically retry to recover them.
 
-- `GET /`: server-rendered interface, no JavaScript
+## Storage and serving
+
+- `GET /`
 - `GET /api/municipalities`
 - `GET /api/opportunities?municipality=088001&project=school&archive=1`
 
-Only GET is accepted. All text is escaped; links use HTTP(S); responses have a restrictive CSP. The service binds loopback by default and has **no authentication or account separation**. Keep it local, or place it behind your own authenticated HTTPS proxy. CLI facts import is for trusted local operators. No public hosting/deployment is configured.
+The web UI escapes text, restricts links to HTTP(S), sets a restrictive CSP and accepts only GET. It binds loopback by default and has no authentication/account separation. Keep it local or behind your own authenticated HTTPS proxy. Closed/ineligible records are hidden unless the archive checkbox is enabled; uncertain results stay visible. The web view does not refresh source documents.
 
-Use `--db /path/funding.sqlite` and `run --cache /path/files` for persistent storage. Back up SQLite with its backup API or stop writers before copying the database; WAL sidecars can hold recent writes. Back up original files as well. `Cargo.lock` is committed to the deliverable. Bundled SQLite removes a system SQLite dependency.
+Use `--db /path/funding.sqlite` and `run --cache /path/files` for persistent storage. Back up SQLite with its backup API or stop writers first; WAL sidecars may contain recent writes. Back up cached originals too. SQLite is bundled, and `Cargo.lock` is committed.
 
-`deploy/` contains optional systemd examples. Inspect paths, create a dedicated service account and protected environment file yourself, set a spending cap, and enable the timer only when ready. Nothing is automatically installed or scheduled.
+`deploy/` contains optional systemd examples. Inspect paths, protect credentials, set a spending cap and enable scheduling yourself. Nothing here installs, deploys or schedules the app automatically.
 
-## Verification
+## Verify
 
 ```sh
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test --all-targets --locked
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --all-targets
 ```
 
-Tests use local HTTP mocks and fixtures, never paid requests. Compact-contract regressions cover Estonian startup versus Italian municipality, open municipal/public-body calls, genuine eligibility ambiguity, unknown unrelated project/deadline facts, both reported invalid scope/manual combinations, and read-only export/replay. They cover exact original-byte payloads, native-only/max-effort parameters, strict schema, bounded calls, changed files, cached versions, partial/failed usage, unknown cost, isolated facts, all six rule operators and safe HTML filtering. An optional ignored adapter regression accepts the separately retained audit snapshots through `FUNDING_AUDIT_DIR`; those bulky source snapshots are not required or bundled.
+Tests use local HTTP mocks and fixtures, never paid calls. They cover literal short/missing evidence, strict types and references, unknown versus false, local applicant exclusion, direct original bytes, full current input for changed notices, cache reuse, zero-call input failures, call limits, actual/unknown costs, private offline replay and safe HTML. One optional ignored adapter test needs separate `FUNDING_AUDIT_DIR` snapshots.
 
-Provider docs checked 6 October 2026:
-- [Native PDF inputs](https://openrouter.ai/docs/guides/overview/multimodal/pdfs)
-- [Reasoning effort and billing](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens)
-- [Structured output](https://openrouter.ai/docs/guides/features/structured-outputs)
-- [Provider routing](https://openrouter.ai/docs/guides/routing/provider-selection)
-- [Luna model](https://openrouter.ai/openai/gpt-6-luna)
+Requests select native PDF handling, the `openai` provider family, required-parameter support, no fallback and max-effort Luna. The provider family may include Flex. Unexpected models, parsed-file annotations, refusal, non-stop finish reasons and malformed output remain rejected. Mock tests cannot establish live output quality or future spend; this simplicity pass makes no paid calls.
 
-The request explicitly selects `file-parser.pdf.engine=native`, `provider.only=["openai"]`, `require_parameters=true`, and `allow_fallbacks=false`. The `openai` provider family may include variants such as Flex; this is not an exact standard-endpoint pin. File annotations, unexpected models, refusal, non-stop finish reasons and malformed output are rejected for review. The exact paid-provider path still needs an operator-authorized pilot; mock tests cannot establish live output quality or spend.
+Provider references: [PDFs](https://openrouter.ai/docs/guides/overview/multimodal/pdfs), [reasoning](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens), [structured output](https://openrouter.ai/docs/guides/features/structured-outputs), [routing](https://openrouter.ai/docs/guides/routing/provider-selection), [Luna](https://openrouter.ai/openai/gpt-6-luna).

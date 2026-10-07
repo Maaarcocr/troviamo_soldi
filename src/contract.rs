@@ -151,9 +151,7 @@ fn string(min: usize, max: usize) -> Value {
     json!({"type":"string","minLength":min,"maxLength":max})
 }
 fn identifier_schema() -> Value {
-    let mut schema = string(1, 160);
-    schema["pattern"] = json!("^[A-Za-z0-9_.:-]+$");
-    schema
+    string(1, 160)
 }
 fn number(nullable: bool) -> Value {
     json!({"type":if nullable {json!(["number","null"])} else {json!("number")},"minimum":0,"maximum":1e15})
@@ -210,7 +208,7 @@ pub fn schema() -> Value {
             if op == "equals" {
                 args["value"] = value.clone();
             } else {
-                args["values"] = json!({"type":"array","items":value,"minItems":1,"maxItems":100});
+                args["values"] = json!({"type":"array","items":value,"minItems":1});
             }
             variants.push(rule_schema(op, args));
         }
@@ -231,7 +229,7 @@ pub fn schema() -> Value {
         if op == "equals" {
             args["value"] = value;
         } else {
-            args["values"] = json!({"type":"array","items":value,"minItems":1,"maxItems":100});
+            args["values"] = json!({"type":"array","items":value,"minItems":1});
         }
         variants.push(rule_schema(op, args));
     }
@@ -264,14 +262,16 @@ pub fn schema() -> Value {
         .collect();
     variants.push(rule_schema("min_days",json!({"field":{"type":"string","enum":dates},"days":{"type":"integer","minimum":0,"maximum":36600}})));
     variants.push(rule_schema("manual", json!({"note":string(1,5000)})));
+    let mut locator = string(1, 1000);
+    locator["type"] = json!(["string", "null"]);
     let citation = object(json!({"id":identifier_schema(),
         "source_url":{"type":"string","description":"Exactly one supplied current source URL."},
-        "locator":string(1,1000),"quote":string(8,10000)}));
+        "locator":locator,"quote":string(1,10000)}));
     object(json!({"schema_version":{"type":"integer","enum":[3]},
         "title":string(1,500),"summary":string(1,10000),
         "status":{"type":"string","enum":["open","forthcoming","closed","unknown"]},
         "opens_on":{"type":["string","null"],"description":"YYYY-MM-DD; null if unknown."},
         "closes_at":{"type":["string","null"],"description":"Application deadline as RFC3339 with explicit timezone; null if unknown. Never invent time/timezone."},
         "requirements":{"type":"array","items":{"anyOf":variants},"maxItems":200},
-        "citations":{"type":"array","items":citation,"minItems":1,"maxItems":300}}))
+        "citations":{"type":"array","items":citation,"maxItems":300}}))
 }

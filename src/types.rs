@@ -62,7 +62,7 @@ pub struct RunSummary {
     pub processed: usize,
     pub unchanged: usize,
     pub calls: usize,
-    pub accepted: usize,
+    pub extracted: usize,
     pub needs_review: usize,
     pub failed: usize,
     pub prompt_tokens_reported: u64,

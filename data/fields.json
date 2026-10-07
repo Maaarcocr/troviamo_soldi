@@ -317,7 +317,7 @@
     "type": "number",
     "integer": true,
     "scope": "municipality",
-    "help": "Indica data e fonte ISTAT; nessuna popolazione è presunta.",
+    "help": "Soglia di popolazione richiesta dal bando, con la base demografica e la data di riferimento eventualmente specificate.",
     "maxAgeDays": 730
   },
   "financial.currentStatus": {
@@ -343,7 +343,7 @@
       }
     ],
     "maxAgeDays": 90,
-    "help": "Usa un atto attuale. L’assenza da un elenco storico non prova la gestione ordinaria."
+    "help": "Situazione finanziaria attuale, distinta dalla presenza in elenchi storici di dissesto o riequilibrio."
   },
   "financial.dissestoHistory": {
     "label": "Presenza nell’elenco storico dei dissesti",
@@ -479,7 +479,7 @@
     "label": "Ricavi effettivi per il saldo (€)",
     "type": "number",
     "scope": "application",
-    "help": "Solo ricavi effettivi rilevanti secondo l’avviso. Se non sono ancora noti, lascia vuoto: il controllo a saldo rimane ignoto.",
+    "help": "Ricavi effettivi rilevanti per il saldo secondo la definizione dell’avviso, distinti dai ricavi previsti.",
     "maxAgeDays": 120
   },
   "application.noDoubleFunding": {
