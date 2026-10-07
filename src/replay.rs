@@ -537,6 +537,26 @@ mod tests {
     }
 
     #[test]
+    fn replay_accepts_factual_v3_without_a_global_verdict() {
+        let mut facts = extraction();
+        facts.as_object_mut().unwrap().remove("needs_review");
+        facts.as_object_mut().unwrap().remove("review_reasons");
+        facts["schema_version"] = json!(3);
+        facts["requirements"] = json!([]);
+        let actual = result(row(&facts));
+        assert_eq!(actual["category"], "valid_extraction_review");
+        assert_eq!(actual["contract_validation"], "passed");
+        assert_eq!(actual["extraction"], facts);
+        assert!(
+            actual["review_reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|reason| reason.as_str().unwrap().contains("No requirements"))
+        );
+    }
+
+    #[test]
     fn replay_preserves_pipeline_coverage_review() {
         let mut saved = row(&extraction());
         saved["version"]["saved_extraction"] =

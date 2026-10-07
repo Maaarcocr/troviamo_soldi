@@ -170,7 +170,9 @@ pub fn run(
                 let sources: Vec<_> = std::iter::once(notice.source_url.clone())
                     .chain(documents.iter().map(|d| d.url.clone()))
                     .collect();
-                match model::parse_response(&response, &sources) {
+                match model::parse_response(&response, &sources)
+                    .and_then(|facts| crate::contract::to_stored(&facts))
+                {
                     Ok(mut extraction) => {
                         let removed = previous
                             .as_ref()

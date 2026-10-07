@@ -46,7 +46,7 @@ The limit caps notices, **not money**. Max-effort reasoning and the size of orig
 
 Documents are downloaded as original bytes, SHA-256 hashed and stored under `var/files/<hash>`. PDFs and PNG/JPEG/WebP/GIF are sent as base64 original bytes. Unsupported files such as DOCX, ZIP or P7M are cached and listed as a coverage gap; they are not unpacked, converted or sent through an OCR fallback. Their presence deterministically forces `needs_review`. A download failure, excess size, or HTML response instead of an attachment stops that notice before a model call.
 
-For an amendment, only changed files are sent with the previous structured extraction and complete current file manifest. If no valid prior extraction exists, all supported files are sent. The prompt requires preserving prior requirements and review for unresolved clauses, removed files, contradictions or missing annexes. This is cheaper than resending originals but is not independent verification of the prior interpretation. Changes to source content or attachment lists also create versions. Reappearing identical versions reuse their own cached result.
+For an amendment, only changed files are sent with the previous structured extraction and complete current file manifest. If no valid prior extraction exists, all supported files are sent. The prompt asks to retain supported prior facts. Rust flags removed or unsupported originals; unresolved individual conditions remain manual. This is cheaper than resending originals but is not independent verification of the prior interpretation. Changes to source content or attachment lists also create versions. Reappearing identical versions reuse their own cached result.
 
 Without attachments, real source HTML/text/JSON is sent as text input. No pretend PDF is made. There is no OCR or local PDF parsing at any stage.
 
@@ -72,7 +72,7 @@ The generic six-operator evaluator uses `data/fields.json`. It does not branch o
 
 ## Extraction contract and zero-cost diagnostics
 
-Luna extracts source facts; Rust decides applicability. Contract version 2 uses compact, cited conditions:
+Luna extracts source facts; Rust decides applicability. Contract version 3 asks only for compact, cited facts, without a model-authored eligibility decision or global review verdict:
 
 ```json
 {"id":"country","label":"Sede in Estonia","op":"one_of","field":"entity.country","values":["EE"],"citation_ids":["c1"]}
@@ -82,10 +82,10 @@ An additional `entity.kind = startup` condition describes a startup-only call. B
 
 - The model never supplies `scope` or `blocker`. Rust derives them from the evidence field. The legacy internal `municipality` scope means applicant-intrinsic information.
 - Each operator has only its own arguments. A manual clause has `id`, `label`, `op`, `note`, and `citation_ids`; it cannot carry a field or unused numeric arguments.
-- Conditions are ANDed; `one_of` allows alternative values of one field. Other alternatives/uncertainty remain manual. If missing coverage, contradictions or alternative eligibility routes could invalidate a definite condition, `review_reasons` keeps the entire result under review.
+- Conditions are ANDed; each structured condition must be necessary on its own. `one_of` allows alternative values of one field; other alternatives/uncertainty remain together in a manual condition. Missing nullable values stay `null`, and an unknown status stays `unknown`.
 - Unknown deadline/status and unrelated project/manual conditions remain individually unknown. They do not undo a clearly cited, definite applicant country/type mismatch. They do prevent a positive match when there is no settled exclusion.
-- `accepted` counts successfully extracted source facts without source-level review flags. It is **not** the number of eligible grants. CLI diagnostics print unresolved facts separately; local matching produces `excluded`, `ineligible`, `screening_match` or review states with reasons.
-- Existing SQLite tables, cached versions, raw provider responses and legacy extractions are retained. Legacy review outputs are not silently repaired or promoted. Invalid legacy records remain visible for review; an invalid prior extraction cannot suppress unchanged originals during an already-requested amendment analysis. New provider responses must use version 2; legacy shapes are accepted only by the stored-data/replay path. Duplicate JSON keys are rejected rather than allowing a later key to erase uncertainty. Merely upgrading does not issue paid calls or rewrite old results.
+- `accepted` counts successfully extracted source facts without Rust-detected input coverage failures or an empty requirement list. It is **not** the number of eligible grants. CLI diagnostics print unresolved facts separately; local matching produces `excluded`, `ineligible`, `screening_match` or review states with reasons.
+- Existing SQLite tables, cached versions, raw provider responses and legacy extractions are retained. Legacy review outputs are not silently repaired or promoted. Invalid legacy records remain visible for review; an invalid prior extraction cannot suppress unchanged originals during an already-requested amendment analysis. New provider responses must use version 3. A small adapter keeps the existing version-2 SQLite extraction shape, adding only Rust-detected coverage/empty-result reasons. Original version-3 provider responses remain unchanged in the attempt log. Legacy shapes and their historical review flags are accepted only by the stored-data/replay path; they are never silently cleared. Duplicate JSON keys are rejected rather than allowing a later key to erase uncertainty. Merely upgrading does not issue paid calls or rewrite old results.
 
 To diagnose saved attempts without spending again:
 
