@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail, ensure};
 use reqwest::blocking::Client;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use rayon::prelude::*;
 use std::{collections::HashSet, io::Read, path::PathBuf};
 use url::Url;
 
@@ -18,6 +19,15 @@ pub struct RunOptions {
     pub allow_localhost: bool,
     pub retry_failed: bool,
     pub dry_run: bool,
+}
+
+struct WorkItem {
+    version: i64,
+    attempt: i64,
+    body: Value,
+    notice: Notice,
+    documents: Vec<DocumentVersion>,
+    previous: Option<Vec<DocumentVersion>>,
 }
 pub fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -36,6 +46,8 @@ pub fn run(
         ..Default::default()
     };
     let mut seen = HashSet::new();
+    let mut work_items: Vec<WorkItem> = Vec::new();
+    // Phase 1: serial preparation (DB reads/writes, document download)
     for notice in notices {
         if summary.processed >= options.limit {
             break;
@@ -98,7 +110,6 @@ pub fn run(
             continue;
         }
         let version = store.begin_version(&notice, &fingerprint, &documents)?;
-        let model = model.context("Model client missing for non-dry run")?;
         let body = match model::request_body(&notice, &documents, &options.cache_dir) {
             Ok(body) => body,
             Err(error) => {
@@ -109,92 +120,111 @@ pub fn run(
         };
         let attempt = store.attempt(version, &sha256(serde_json::to_string(&body)?.as_bytes()))?;
         summary.calls += 1;
-        let response = model.send(&body);
-        match response {
-            Err(error) => {
-                let usage = Usage::default();
-                summary.add_usage(&usage);
-                summary.failed += 1;
-                let error = format!("{error:#}");
-                store.finish_attempt(attempt, "failed", None, &usage, Some(&error))?;
-                store.finish_version(version, "failed", None, Some(&error))?;
-                eprintln!("{}: failed; no automatic retry", notice.id);
-            }
-            Ok(response) => {
-                let usage = model::usage(&response);
-                summary.add_usage(&usage);
-                let sources: Vec<_> = std::iter::once(notice.source_url.clone())
-                    .chain(documents.iter().map(|d| d.url.clone()))
-                    .collect();
-                match model::parse_response(&response, &sources)
-                    .and_then(|facts| crate::contract::to_stored(&facts))
-                {
-                    Ok(mut extraction) => {
-                        let removed = previous
-                            .as_ref()
-                            .map(|old| {
-                                old.iter()
-                                    .filter(|d| {
-                                        !documents.iter().any(|current| current.url == d.url)
-                                    })
-                                    .map(|d| d.filename.clone())
-                                    .collect::<Vec<_>>()
-                            })
-                            .unwrap_or_default();
-                        if !removed.is_empty() {
-                            extraction["review_reasons"].as_array_mut().unwrap().push(json!(format!("Previously supplied files are no longer listed: {}. Verify whether their requirements still apply.",removed.join(", "))));
-                        }
-                        let unsupported: Vec<_> = documents
-                            .iter()
-                            .filter(|d| !model::supported_mime(&d.mime_type))
-                            .map(|d| d.filename.clone())
-                            .collect();
-                        if !unsupported.is_empty() {
-                            extraction["review_reasons"].as_array_mut().unwrap().push(json!(format!("Original files not readable by this native PDF/image path: {}. Requirements may be incomplete.",unsupported.join(", "))));
-                        }
+        work_items.push(WorkItem {
+            version,
+            attempt,
+            body,
+            notice: notice.clone(),
+            documents: documents.clone(),
+            previous: previous.clone(),
+        });
+    }
 
-                        let reasons = engine::extraction_review_reasons(&extraction);
-                        let source_uncertainty = extraction["review_reasons"]
-                            .as_array()
-                            .is_some_and(|a| !a.is_empty());
-                        let state = if source_uncertainty {
-                            summary.needs_review += 1;
-                            "needs_review"
-                        } else {
-                            summary.extracted += 1;
-                            "extracted"
-                        };
-                        // Source extraction and local municipality screening are separate steps.
-                        store.finish_attempt(attempt, state, Some(&response), &usage, None)?;
-                        store.finish_version(version, state, Some(&extraction), None)?;
-                        eprintln!(
-                            "{}: {state}; cost {} USD",
-                            notice.id,
-                            usage
-                                .cost_usd
-                                .map(|v| v.to_string())
-                                .unwrap_or_else(|| "unknown".into())
-                        );
-                        for reason in reasons {
-                            eprintln!("  unresolved fact: {reason}");
+    // Phase 2: parallel AI calls (rayon)
+    let model_client = model.context("Model client missing for non-dry run")?;
+    let responses: Vec<_> = work_items
+        .par_iter()
+        .map(|w| model_client.send(&w.body))
+        .collect();
+
+    // Phase 3: serial result processing (DB writes)
+    for (work_item, response) in work_items.into_iter().zip(responses.into_iter()) {
+        let WorkItem { version, attempt, notice, documents, previous, .. } = work_item;
+            match response {
+                Err(error) => {
+                    let usage = Usage::default();
+                    summary.add_usage(&usage);
+                    summary.failed += 1;
+                    let error = format!("{error:#}");
+                    store.finish_attempt(attempt, "failed", None, &usage, Some(&error))?;
+                    store.finish_version(version, "failed", None, Some(&error))?;
+                    eprintln!("{}: failed; no automatic retry", notice.id);
+                }
+                Ok(response) => {
+                    let usage = model::usage(&response);
+                    summary.add_usage(&usage);
+                    let sources: Vec<_> = std::iter::once(notice.source_url.clone())
+                        .chain(documents.iter().map(|d| d.url.clone()))
+                        .collect();
+                    match model::parse_response(&response, &sources)
+                        .and_then(|facts| crate::contract::to_stored(&facts))
+                    {
+                        Ok(mut extraction) => {
+                            let removed = previous
+                                .as_ref()
+                                .map(|old| {
+                                    old.iter()
+                                        .filter(|d| {
+                                            !documents.iter().any(|current| current.url == d.url)
+                                        })
+                                        .map(|d| d.filename.clone())
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default();
+                            if !removed.is_empty() {
+                                extraction["review_reasons"].as_array_mut().unwrap().push(json!(format!("Previously supplied files are no longer listed: {}. Verify whether their requirements still apply.",removed.join(", "))));
+                            }
+                            let unsupported: Vec<_> = documents
+                                .iter()
+                                .filter(|d| !model::supported_mime(&d.mime_type))
+                                .map(|d| d.filename.clone())
+                                .collect();
+                            if !unsupported.is_empty() {
+                                extraction["review_reasons"].as_array_mut().unwrap().push(json!(format!("Original files not readable by this native PDF/image path: {}. Requirements may be incomplete.",unsupported.join(", "))));
+                            }
+
+                            let reasons = engine::extraction_review_reasons(&extraction);
+                            let source_uncertainty = extraction["review_reasons"]
+                                .as_array()
+                                .is_some_and(|a| !a.is_empty());
+                            let state = if source_uncertainty {
+                                summary.needs_review += 1;
+                                "needs_review"
+                            } else {
+                                summary.extracted += 1;
+                                "extracted"
+                            };
+                            // Source extraction and local municipality screening are separate steps.
+                            store.finish_attempt(attempt, state, Some(&response), &usage, None)?;
+                            store.finish_version(version, state, Some(&extraction), None)?;
+                            eprintln!(
+                                "{}: {state}; cost {} USD",
+                                notice.id,
+                                usage
+                                    .cost_usd
+                                    .map(|v| v.to_string())
+                                    .unwrap_or_else(|| "unknown".into())
+                            );
+                            for reason in reasons {
+                                eprintln!("  unresolved fact: {reason}");
+                            }
                         }
-                    }
-                    Err(error) => {
-                        summary.needs_review += 1;
-                        let error = format!("{error:#}");
-                        store.finish_attempt(
-                            attempt,
-                            "needs_review",
-                            Some(&response),
-                            &usage,
-                            Some(&error),
-                        )?;
-                        store.finish_version(version, "needs_review", None, Some(&error))?;
-                        eprintln!("{}: needs review ({error})", notice.id);
+                        Err(error) => {
+                            summary.needs_review += 1;
+                            let error = format!("{error:#}");
+                            store.finish_attempt(
+                                attempt,
+                                "needs_review",
+                                Some(&response),
+                                &usage,
+                                Some(&error),
+                            )?;
+                            store.finish_version(version, "needs_review", None, Some(&error))?;
+                            eprintln!("{}: needs review ({error})", notice.id);
+                        }
                     }
                 }
             }
-        }
     }
     summary.finish();
     if !options.dry_run {
