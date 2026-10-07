@@ -133,12 +133,20 @@ pub fn to_legacy(value: &Value) -> Result<Value> {
         expanded
             .push(expand().with_context(|| format!("Requirement {} ({})", index + 1, rule["id"]))?);
     }
-    let reasons = value["review_reasons"]
+    let mut reasons = value["review_reasons"]
         .as_array()
-        .context("review_reasons must be an array")?;
+        .context("review_reasons must be an array")?
+        .clone();
+    // Applicant type is mandatory: without it, the engine cannot determine
+    // whether the bando applies to municipalities.
+    let has_applicant = expanded.iter().any(|r| r["blocker"] == "applicant");
+    if !has_applicant {
+        reasons.push(json!("No applicant-type requirement was extracted; cannot determine eligibility for municipalities"));
+    }
     let mut out = value.clone();
     out.as_object_mut().unwrap().remove("schema_version");
     out["needs_review"] = json!(!reasons.is_empty());
+    out["review_reasons"] = json!(reasons);
     out["requirements"] = json!(expanded);
     Ok(out)
 }
