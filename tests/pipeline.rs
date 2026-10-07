@@ -21,6 +21,7 @@ use tiny_http::{Header, Response, Server};
 struct Mock {
     base: String,
     docs: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    fetches: Arc<Mutex<Vec<String>>>,
     requests: Arc<Mutex<Vec<Value>>>,
     response_mode: Arc<Mutex<String>>,
     stop: Arc<AtomicBool>,
@@ -31,11 +32,13 @@ impl Mock {
         let server = Server::http("127.0.0.1:0").unwrap();
         let base = format!("http://{}", server.server_addr());
         let docs = Arc::new(Mutex::new(HashMap::<String, Vec<u8>>::new()));
+        let fetches = Arc::new(Mutex::new(Vec::<String>::new()));
         let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
         let response_mode = Arc::new(Mutex::new("ok".to_string()));
         let stop = Arc::new(AtomicBool::new(false));
-        let (d, r, m, s) = (
+        let (d, f, r, m, s) = (
             docs.clone(),
+            fetches.clone(),
             requests.clone(),
             response_mode.clone(),
             stop.clone(),
@@ -136,6 +139,7 @@ impl Mock {
                         ))
                         .unwrap();
                 } else {
+                    f.lock().unwrap().push(request.url().to_owned());
                     let data = d.lock().unwrap().get(request.url()).cloned();
                     let response = match data {
                         Some(bytes) => Response::from_data(bytes),
@@ -148,6 +152,7 @@ impl Mock {
         Self {
             base,
             docs,
+            fetches,
             requests,
             response_mode,
             stop,
@@ -218,7 +223,7 @@ fn db(temp: &TempDir) -> Store {
 }
 
 #[test]
-fn limit_cache_native_bytes_and_amendment_context() {
+fn limit_cache_native_bytes_and_complete_changed_version() {
     let mock = Mock::new();
     let temp = TempDir::new().unwrap();
     let mut store = db(&temp);
@@ -253,9 +258,9 @@ fn limit_cache_native_bytes_and_amendment_context() {
         .split("INPUT DATA:")
         .next()
         .unwrap();
-    assert!(instruction.contains("Do your best"));
     assert!(instruction.split_whitespace().count() < 140);
     assert!(!instruction.contains("review_reasons"));
+    assert!(!instruction.contains("previous"));
     assert!(
         request["response_format"]["json_schema"]["schema"]["properties"]
             .get("review_reasons")
@@ -273,16 +278,16 @@ fn limit_cache_native_bytes_and_amendment_context() {
     assert_eq!(
         request["response_format"]["json_schema"]["schema"]["properties"]["citations"]["items"]["properties"]
             ["source_url"]["enum"],
-        metadata["allowed_citation_urls"]
+        json!([
+            notices[0].source_url,
+            notices[0].documents[0].url,
+            notices[0].documents[1].url
+        ])
     );
+    assert!(chrono::DateTime::parse_from_rfc3339(metadata["as_of"].as_str().unwrap()).is_ok());
+    assert!(metadata.get("allowed_citation_urls").is_none());
     assert!(
-        metadata["allowed_citation_urls"]
-            .as_array()
-            .unwrap()
-            .contains(&json!(notices[0].source_url))
-    );
-    assert!(
-        metadata["allowed_fields"]
+        metadata["fields"]
             .as_object()
             .unwrap()
             .values()
@@ -314,15 +319,31 @@ fn limit_cache_native_bytes_and_amendment_context() {
     let amended = requests.last().unwrap();
     assert_eq!(
         amended["messages"][0]["content"].as_array().unwrap().len(),
-        2,
-        "Only changed annex sent"
+        3,
+        "Every current original is sent, including the unchanged main document"
     );
     let text = amended["messages"][0]["content"][0]["text"]
         .as_str()
         .unwrap();
     let data: Value = serde_json::from_str(text.split("INPUT DATA:\n").nth(1).unwrap()).unwrap();
-    assert!(data["prior_extraction_unverified"].is_object());
-    assert_eq!(data["current_documents"].as_array().unwrap().len(), 2);
+    assert!(data.get("prior_extraction_unverified").is_none());
+    assert!(data.get("changed_documents").is_none());
+    assert_eq!(data["documents"].as_array().unwrap().len(), 2);
+    for (part, expected) in amended["messages"][0]["content"].as_array().unwrap()[1..]
+        .iter()
+        .zip([
+            b"%PDF-1.4 ORIGINAL EXACT BYTES\x00".as_slice(),
+            b"%PDF-1.4 ANNEX v2 AMENDMENT".as_slice(),
+        ])
+    {
+        let data = part["file"]["file_data"].as_str().unwrap();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(data.split(',').nth(1).unwrap())
+                .unwrap(),
+            expected
+        );
+    }
     assert_eq!(store.stats().unwrap()["versions"], 3);
     drop(requests);
     // Reappearance of byte-identical prior version uses that exact cached extraction.
@@ -439,6 +460,196 @@ fn no_pdf_uses_real_source_text_without_fake_attachment() {
             .contains("Official source body")
     );
 }
+
+#[test]
+fn bare_url_input_is_not_fetched_and_never_calls_the_model() {
+    for source_text in [None, Some(" \n\t".to_owned())] {
+        let mock = Mock::new();
+        let temp = TempDir::new().unwrap();
+        let mut store = db(&temp);
+        let mut notice = mock.notice("bare", &[]);
+        notice.source_text = source_text;
+        mock.put(
+            "/notice/bare",
+            b"<html><body>Portal app shell</body></html>",
+        );
+        let summary = pipeline::run(
+            &mut store,
+            &http(),
+            Some(&mock.model()),
+            vec![notice],
+            &options(&temp, 1),
+        )
+        .unwrap();
+        assert_eq!(
+            (summary.processed, summary.failed, summary.calls),
+            (1, 1, 0)
+        );
+        assert_eq!(summary.reported_cost_usd, 0.0);
+        assert!(mock.requests.lock().unwrap().is_empty());
+        assert!(mock.fetches.lock().unwrap().is_empty());
+        let saved = store.latest_notices().unwrap();
+        assert!(
+            saved[0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("provide source_text or original documents")
+        );
+        assert!(saved[0]["extraction"].is_null());
+        assert_eq!(store.stats().unwrap()["attempts"], 0);
+    }
+}
+
+#[test]
+fn unsupported_originals_without_text_never_call_the_model() {
+    let mock = Mock::new();
+    let temp = TempDir::new().unwrap();
+    let mut store = db(&temp);
+    mock.put("/zip", b"PK\x03\x04unsupported zip");
+    let mut notice = mock.notice("unsupported", &["/zip"]);
+    notice.source_text = None;
+    let summary = pipeline::run(
+        &mut store,
+        &http(),
+        Some(&mock.model()),
+        vec![notice],
+        &options(&temp, 1),
+    )
+    .unwrap();
+    assert_eq!(
+        (summary.processed, summary.failed, summary.calls),
+        (1, 1, 0)
+    );
+    assert_eq!(summary.reported_cost_usd, 0.0);
+    assert!(mock.requests.lock().unwrap().is_empty());
+    let saved = store.latest_notices().unwrap();
+    assert!(
+        saved[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("all original documents are unsupported")
+    );
+    assert_eq!(store.stats().unwrap()["attempts"], 0);
+}
+
+#[test]
+fn supplied_web_document_is_not_classified_by_keywords() {
+    let mock = Mock::new();
+    let temp = TempDir::new().unwrap();
+    let mut store = db(&temp);
+    let mut notice = mock.notice("html", &[]);
+    let source = "<html><body><p>Enable JavaScript for the application form. Municipalities may apply before 31 December.</p><footer>Cookies</footer><script>initialize();</script></body></html>";
+    notice.source_text = Some(source.into());
+    let summary = pipeline::run(
+        &mut store,
+        &http(),
+        Some(&mock.model()),
+        vec![notice],
+        &options(&temp, 1),
+    )
+    .unwrap();
+    assert_eq!((summary.extracted, summary.calls), (1, 1));
+    assert!(mock.fetches.lock().unwrap().is_empty());
+    let requests = mock.requests.lock().unwrap();
+    let prompt = requests[0]["messages"][0]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let metadata: Value =
+        serde_json::from_str(prompt.split("INPUT DATA:\n").nth(1).unwrap()).unwrap();
+    assert_eq!(metadata["source_content"], source);
+}
+
+#[test]
+fn source_text_change_resends_unchanged_originals_without_prior_output() {
+    let mock = Mock::new();
+    let temp = TempDir::new().unwrap();
+    let mut store = db(&temp);
+    mock.put("/original", b"%PDF-1.4 unchanged original");
+    let mut notice = mock.notice("one", &["/original"]);
+    pipeline::run(
+        &mut store,
+        &http(),
+        Some(&mock.model()),
+        vec![notice.clone()],
+        &options(&temp, 1),
+    )
+    .unwrap();
+    notice.source_text = Some("Updated source dates and conditions".into());
+    let changed = pipeline::run(
+        &mut store,
+        &http(),
+        Some(&mock.model()),
+        vec![notice.clone()],
+        &options(&temp, 1),
+    )
+    .unwrap();
+    assert_eq!((changed.calls, changed.extracted), (1, 1));
+    let unchanged = pipeline::run(
+        &mut store,
+        &http(),
+        Some(&mock.model()),
+        vec![notice],
+        &options(&temp, 1),
+    )
+    .unwrap();
+    assert_eq!((unchanged.unchanged, unchanged.calls), (1, 0));
+    let requests = mock.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[1]["messages"][0]["content"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let prompt = requests[1]["messages"][0]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let metadata: Value =
+        serde_json::from_str(prompt.split("INPUT DATA:\n").nth(1).unwrap()).unwrap();
+    assert!(metadata.get("prior_extraction_unverified").is_none());
+    assert_eq!(
+        metadata["source_content"],
+        "Updated source dates and conditions"
+    );
+}
+
+#[test]
+fn cached_legacy_screened_version_is_not_reprocessed() {
+    let mock = Mock::new();
+    let temp = TempDir::new().unwrap();
+    let mut store = db(&temp);
+    let notice = mock.notice("legacy", &[]);
+    pipeline::run(
+        &mut store,
+        &http(),
+        Some(&mock.model()),
+        vec![notice.clone()],
+        &options(&temp, 1),
+    )
+    .unwrap();
+    store
+        .conn
+        .execute("UPDATE versions SET state='screened'", [])
+        .unwrap();
+    let mut opts = options(&temp, 1);
+    opts.retry_failed = true;
+    let summary = pipeline::run(
+        &mut store,
+        &http(),
+        Some(&mock.model()),
+        vec![notice],
+        &opts,
+    )
+    .unwrap();
+    assert_eq!(
+        (summary.unchanged, summary.processed, summary.calls),
+        (1, 0, 0)
+    );
+    assert_eq!(mock.requests.lock().unwrap().len(), 1);
+    assert_eq!(store.latest_notices().unwrap()[0]["state"], "screened");
+}
+
 #[test]
 fn imports_remain_municipality_project_scoped_and_untrusted() {
     let temp = TempDir::new().unwrap();
@@ -505,7 +716,9 @@ fn review_retry_resends_originals_and_unsupported_files_force_review() {
     let mut store = db(&temp);
     mock.put("/good", b"%PDF-1.4 valid");
     mock.put("/annex", b"PK\x03\x04unsupported zip");
-    let notices = vec![mock.notice("one", &["/good", "/annex"])];
+    let mut notice = mock.notice("one", &["/good", "/annex"]);
+    notice.source_text = None;
+    let notices = vec![notice];
     let first = pipeline::run(
         &mut store,
         &http(),
@@ -605,7 +818,7 @@ fn removed_attachment_forces_review_and_original_cache_self_repairs() {
 }
 
 #[test]
-fn valid_incompatible_call_is_accepted_as_extraction_not_model_rejected() {
+fn valid_incompatible_call_is_extracted_before_local_screening() {
     for mode in ["estonian_startup", "individual"] {
         let mock = Mock::new();
         *mock.response_mode.lock().unwrap() = mode.into();
@@ -621,7 +834,7 @@ fn valid_incompatible_call_is_accepted_as_extraction_not_model_rejected() {
         .unwrap();
         assert_eq!(
             (
-                summary.accepted,
+                summary.extracted,
                 summary.needs_review,
                 summary.failed,
                 summary.calls
@@ -629,8 +842,16 @@ fn valid_incompatible_call_is_accepted_as_extraction_not_model_rejected() {
             (1, 0, 0, 1)
         );
         let notices = store.latest_notices().unwrap();
-        assert_eq!(notices[0]["state"], "screened");
+        assert_eq!(notices[0]["state"], "extracted");
         assert!(notices[0]["error"].is_null());
+        let attempt_state: String = store
+            .conn
+            .query_row("SELECT state FROM attempts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(attempt_state, "extracted");
+        let serialized_summary = serde_json::to_value(&summary).unwrap();
+        assert_eq!(serialized_summary["extracted"], 1);
+        assert!(serialized_summary.get("accepted").is_none());
         let municipality =
             json!({"istatCode":"081001","region":"Sicilia","registryReferenceDate":"2026-10-06"});
         let result = funding_rust::engine::evaluate(
@@ -664,7 +885,7 @@ fn valid_incompatible_call_is_accepted_as_extraction_not_model_rejected() {
 }
 
 #[test]
-fn invalid_legacy_amendment_base_resends_all_originals_without_repairing_the_old_record() {
+fn malformed_prior_extraction_is_not_read_or_reused_for_a_changed_version() {
     let mock = Mock::new();
     let temp = TempDir::new().unwrap();
     let mut store = db(&temp);
@@ -679,14 +900,10 @@ fn invalid_legacy_amendment_base_resends_all_originals_without_repairing_the_old
         &options(&temp, 1),
     )
     .unwrap();
-    let mut legacy: Value = serde_json::from_str(include_str!("fixtures/extraction.json")).unwrap();
-    legacy["requirements"][0]["field"] = json!("entity.region");
-    legacy["requirements"][0]["value"] = json!("Sicily");
-    legacy["citations"][0]["source_url"] = json!(notice.source_url);
-    let original = legacy.to_string();
+    let original = "{malformed prior extraction";
     store
         .conn
-        .execute("UPDATE versions SET extraction=?1 WHERE id=1", [&original])
+        .execute("UPDATE versions SET extraction=?1 WHERE id=1", [original])
         .unwrap();
     mock.put("/annex", b"%PDF-1.4 changed annex");
     let summary = pipeline::run(
@@ -713,7 +930,7 @@ fn invalid_legacy_amendment_base_resends_all_originals_without_repairing_the_old
             .unwrap(),
     )
     .unwrap();
-    assert!(metadata["prior_extraction_unverified"].is_null());
+    assert!(metadata.get("prior_extraction_unverified").is_none());
     let preserved: String = store
         .conn
         .query_row("SELECT extraction FROM versions WHERE id=1", [], |row| {

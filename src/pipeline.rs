@@ -8,11 +8,7 @@ use anyhow::{Context, Result, bail, ensure};
 use reqwest::blocking::Client;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{
-    collections::{BTreeMap, HashSet},
-    io::Read,
-    path::PathBuf,
-};
+use std::{collections::HashSet, io::Read, path::PathBuf};
 use url::Url;
 
 pub struct RunOptions {
@@ -42,7 +38,7 @@ pub fn run(
         ..Default::default()
     };
     let mut seen = HashSet::new();
-    for mut notice in notices {
+    for notice in notices {
         if summary.processed >= options.limit {
             break;
         }
@@ -54,7 +50,7 @@ pub fn run(
             "Invalid notice ID"
         );
         let previous = store.previous(&notice.id)?;
-        let prepared = prepare(client, &mut notice, options);
+        let prepared = prepare(client, &notice, options);
         let documents = match prepared {
             Ok(docs) => docs,
             Err(error) => {
@@ -107,50 +103,16 @@ pub fn run(
             continue;
         }
         let version = store.begin_version(&notice, &fingerprint, &documents)?;
-        let previous_extraction = if cached.is_some() && options.retry_failed {
-            None
-        } else {
-            previous.as_ref().and_then(|(docs, extraction)| {
-                let sources: Vec<_> = std::iter::once(notice.source_url.clone())
-                    .chain(docs.iter().map(|d| d.url.clone()))
-                    .collect();
-                extraction
-                    .as_ref()
-                    .filter(|extraction| engine::validate_extraction(extraction, &sources).is_ok())
-            })
-        };
-        let previous_hashes: BTreeMap<&str, &str> = if previous_extraction.is_some() {
-            previous
-                .as_ref()
-                .unwrap()
-                .0
-                .iter()
-                .map(|d| (d.url.as_str(), d.sha256.as_str()))
-                .collect()
-        } else {
-            BTreeMap::new()
-        };
-        let changed: Vec<_> = documents
-            .iter()
-            .filter(|d| previous_hashes.get(d.url.as_str()).copied() != Some(d.sha256.as_str()))
-            .cloned()
-            .collect();
         let model = model.context("Model client missing for non-dry run")?;
-        let body = match model::request_body(
-            &notice,
-            &changed,
-            &documents,
-            &options.cache_dir,
-            previous_extraction,
-            model.max_tokens,
-        ) {
-            Ok(body) => body,
-            Err(error) => {
-                summary.failed += 1;
-                store.finish_version(version, "failed", None, Some(&error.to_string()))?;
-                continue;
-            }
-        };
+        let body =
+            match model::request_body(&notice, &documents, &options.cache_dir, model.max_tokens) {
+                Ok(body) => body,
+                Err(error) => {
+                    summary.failed += 1;
+                    store.finish_version(version, "failed", None, Some(&error.to_string()))?;
+                    continue;
+                }
+            };
         let attempt = store.attempt(version, &sha256(serde_json::to_string(&body)?.as_bytes()))?;
         summary.calls += 1;
         let response = model.send(&body);
@@ -176,7 +138,7 @@ pub fn run(
                     Ok(mut extraction) => {
                         let removed = previous
                             .as_ref()
-                            .map(|(old, _)| {
+                            .map(|old| {
                                 old.iter()
                                     .filter(|d| {
                                         !documents.iter().any(|current| current.url == d.url)
@@ -186,9 +148,6 @@ pub fn run(
                             })
                             .unwrap_or_default();
                         if !removed.is_empty() {
-                            if extraction["schema_version"] != 2 {
-                                extraction["needs_review"] = json!(true);
-                            }
                             extraction["review_reasons"].as_array_mut().unwrap().push(json!(format!("Previously supplied files are no longer listed: {}. Verify whether their requirements still apply.",removed.join(", "))));
                         }
                         let unsupported: Vec<_> = documents
@@ -197,9 +156,6 @@ pub fn run(
                             .map(|d| d.filename.clone())
                             .collect();
                         if !unsupported.is_empty() {
-                            if extraction["schema_version"] != 2 {
-                                extraction["needs_review"] = json!(true);
-                            }
                             extraction["review_reasons"].as_array_mut().unwrap().push(json!(format!("Original files not readable by this native PDF/image path: {}. Requirements may be incomplete.",unsupported.join(", "))));
                         }
 
@@ -211,10 +167,10 @@ pub fn run(
                             summary.needs_review += 1;
                             "needs_review"
                         } else {
-                            summary.accepted += 1;
-                            "screened"
+                            summary.extracted += 1;
+                            "extracted"
                         };
-                        // An accepted extraction is not an eligible opportunity. The local matcher decides that.
+                        // Source extraction and local municipality screening are separate steps.
                         store.finish_attempt(attempt, state, Some(&response), &usage, None)?;
                         store.finish_version(version, state, Some(&extraction), None)?;
                         eprintln!(
@@ -260,29 +216,20 @@ fn fingerprint(notice: &Notice, docs: &[DocumentVersion]) -> Result<String> {
     ordered.sort_by_key(Value::to_string);
     Ok(sha256(serde_json::to_string(&json!({"id":notice.id,"title":notice.title,"source_url":notice.source_url,"source_text":notice.source_text,"documents":ordered}))?.as_bytes()))
 }
-fn prepare(
-    client: &Client,
-    notice: &mut Notice,
-    options: &RunOptions,
-) -> Result<Vec<DocumentVersion>> {
+fn prepare(client: &Client, notice: &Notice, options: &RunOptions) -> Result<Vec<DocumentVersion>> {
     validate_url(&notice.source_url, options)?;
     ensure!(
         notice.documents.len() <= 20,
         "More than 20 files; application limit requires manual review"
     );
-    if notice.documents.is_empty()
-        && notice
-            .source_text
-            .as_ref()
-            .is_none_or(|s| s.trim().is_empty())
-    {
-        let (bytes, mime) = download(client, &notice.source_url, options, 2 * 1024 * 1024)?;
-        ensure!(
-            mime.starts_with("text/") || mime == "application/json",
-            "No source text or supported original attachment; review required"
-        );
-        notice.source_text = Some(String::from_utf8(bytes).context("Source content is not UTF-8")?);
-    }
+    let has_source_text = notice
+        .source_text
+        .as_ref()
+        .is_some_and(|s| !s.trim().is_empty());
+    ensure!(
+        has_source_text || !notice.documents.is_empty(),
+        "No source content supplied: provide source_text or original documents, or use source discovery; a URL alone is not extraction input. No model call made"
+    );
     ensure!(
         notice
             .source_text
@@ -337,12 +284,11 @@ fn prepare(
         });
     }
     ensure!(
-        !documents.is_empty()
-            || notice
-                .source_text
-                .as_ref()
-                .is_some_and(|s| !s.trim().is_empty()),
-        "No usable source content"
+        has_source_text
+            || documents
+                .iter()
+                .any(|d| model::supported_mime(&d.mime_type)),
+        "No readable source content: all original documents are unsupported and source_text is empty. No model call made"
     );
     Ok(documents)
 }

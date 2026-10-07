@@ -207,15 +207,9 @@ CREATE TABLE IF NOT EXISTS evidence(municipality_id TEXT NOT NULL REFERENCES mun
             json!({"municipalities":count("municipalities")?,"notices":count("notices")?,"versions":count("versions")?,"attempts":count("attempts")?,"last_run":last.map(|s|serde_json::from_str::<Value>(&s)).transpose()?}),
         )
     }
-    pub fn previous(&self, id: &str) -> Result<Option<(Vec<DocumentVersion>, Option<Value>)>> {
-        let row:Option<(String,Option<String>)>=self.conn.query_row("SELECT v.documents,v.extraction FROM notices n JOIN versions v ON n.latest_version=v.id WHERE n.id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
-        row.map(|(docs, extraction)| {
-            Ok((
-                serde_json::from_str(&docs)?,
-                extraction.map(|s| serde_json::from_str(&s)).transpose()?,
-            ))
-        })
-        .transpose()
+    pub fn previous(&self, id: &str) -> Result<Option<Vec<DocumentVersion>>> {
+        let row: Option<String> = self.conn.query_row("SELECT v.documents FROM notices n JOIN versions v ON n.latest_version=v.id WHERE n.id=?1", [id], |r| r.get(0)).optional()?;
+        row.map(|docs| Ok(serde_json::from_str(&docs)?)).transpose()
     }
     pub fn cached(&self, id: &str, fingerprint: &str) -> Result<Option<(i64, String)>> {
         Ok(self
