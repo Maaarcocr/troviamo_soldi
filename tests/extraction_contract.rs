@@ -619,3 +619,23 @@ fn missing_boolean_evidence_stays_unknown_while_explicit_false_fails() {
     invalid["requirements"][0]["value"] = json!("true");
     assert!(engine::validate_extraction(&invalid, &sources()).is_err());
 }
+
+#[test]
+fn schema_and_parser_do_not_impose_output_size_caps() {
+    let schema = engine::extraction_schema().to_string();
+    for cap in ["maxLength", "maxItems", "maximum"] {
+        assert!(!schema.contains(&format!("\"{cap}\":")), "unexpected {cap}");
+    }
+    let mut call = facts(extraction(
+        (0..201)
+            .map(|i| condition(&format!("requirement {i}"), "entity.country", json!("IT")))
+            .collect(),
+    ));
+    call["title"] = json!("t".repeat(501));
+    call["summary"] = json!("s".repeat(10_001));
+    call["requirements"][0]["label"] = json!("l".repeat(1001));
+    call["citations"] = json!((0..301).map(|i| json!({"id":format!("c{i}"),"source_url":SOURCE,"locator":null,"quote":"q".repeat(10_001)})).collect::<Vec<_>>());
+    call["requirements"][0]["citation_ids"] =
+        json!((0..31).map(|i| format!("c{i}")).collect::<Vec<_>>());
+    engine::validate_extraction(&call, &sources()).unwrap();
+}

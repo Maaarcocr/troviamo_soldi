@@ -39,7 +39,7 @@ Open http://127.0.0.1:8080. The initial archive is empty. The app bundles 391 Si
 
 `daily` is an alias of `run`. `--limit` is mandatory and counts attempted **bandi**, including input/download/provider failures and review cases. Unchanged cached versions consume no slot and make no model call. Every attempted notice makes at most one model request. A writer lock prevents overlapping CLI runs.
 
-The limit caps notices, **not money**. `--max-tokens` defaults to 32,768 for reasoning plus visible JSON. Truncated output is saved for inspection, not retried. A timeout or interrupted request may have been billed: `--retry-failed` explicitly retries failed, interrupted or review versions and can duplicate charges. Do not use it merely to inspect a failure.
+The limit counts notices, **not money**. Requests keep max reasoning effort and omit output-token caps: [OpenRouter forwards omitted parameters without injecting a value](https://openrouter.ai/docs/api_reference/parameters), so provider defaults and model limits still apply. The app sets no model-request timeout or response-size cap. Incomplete output is saved for inspection, not retried. A provider timeout or interrupted request may have been billed: `--retry-failed` explicitly retries failed, interrupted or review versions and can duplicate charges. Do not use it merely to inspect a failure.
 
 ## Source input
 
@@ -49,7 +49,7 @@ Each notice needs nonblank `source_text` or original documents. A bare ID/title/
 
 Original bytes are SHA-256 hashed and cached under `var/files/<hash>`. PDFs and PNG/JPEG/WebP/GIF are sent directly as base64 originals. DOCX, ZIP, P7M and other unsupported files are retained as coverage gaps; they are not unpacked, converted or OCRed. If there is no source text and every file is unsupported, processing stops before a paid request. With usable input plus unsupported files, extraction can proceed but remains under review.
 
-Downloads require an allowed HTTPS host, including redirect targets. Limits are 25 MiB/file, 50 MiB/notice and 20 files by default; these are application limits, not provider guarantees. Download failure, oversize content or HTML returned as an attachment stops the notice before a model request. Loopback HTTP is only for the test `--mock-url` path.
+Downloads require an allowed HTTPS host, including redirect targets. All supplied source text and supported original files are sent without application size or count caps. Download failure or HTML returned as an attachment stops the notice before a model request. Source fetching retains its transport timeout and redirect-loop protection; provider upload/context limits still apply. Loopback HTTP is only for the test `--mock-url` path.
 
 The request includes the current `as_of` time for interpreting dated windows. Time alone does not change the source fingerprint or trigger another call.
 
@@ -75,7 +75,7 @@ Conditions are ANDed. The six operators are `equals`, `one_of`, `range`, `compar
 
 Countries use ISO alpha-2 codes; applicant types and regions use the catalogue's identifiers. Broad public-body eligibility uses `entity.publicBody=true`. Financial numeric fields use EUR; unsupported currencies/categories remain manual. Unknown values stay unknown, never false or invented zeros.
 
-Every requirement references supplied source citations. A quote can be a single literal value such as `30500`; it must be nonblank and free of unsafe controls. An unknown locator is `null`. An empty extraction may have no citations and remains under review. Duplicate JSON keys, invalid types, missing references and unsupported source URLs are rejected. Quotes are never padded, repaired or independently verified against PDFs. Valid JSON does not prove a correct interpretation.
+The JSON contract has no application-imposed upper bounds on text lengths, list sizes or numeric values. Types, nonblank text, valid dates and references are still checked. Every requirement references supplied source citations. A quote can be a single literal value such as `30500`; it must be nonblank and free of unsafe controls. An unknown locator is `null`. An empty extraction may have no citations and remains under review. Duplicate JSON keys, invalid types, missing references and unsupported source URLs are rejected. Quotes are never padded, repaired or independently verified against PDFs. Valid JSON does not prove a correct interpretation.
 
 `extracted` means usable source facts were saved without an input-coverage failure or empty requirement list. It does **not** mean eligible grants. Unknown dates and individual manual conditions are reported separately. Rust's municipality matcher produces excluded, ineligible, screening-match or review results. Definite applicant mismatches can exclude a call despite unrelated unknown project facts; missing evidence never establishes a positive match.
 

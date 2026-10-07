@@ -147,14 +147,14 @@ fn object(properties: Value) -> Value {
     let required: Vec<_> = properties.as_object().unwrap().keys().cloned().collect();
     json!({"type":"object","properties":properties,"required":required,"additionalProperties":false})
 }
-fn string(min: usize, max: usize) -> Value {
-    json!({"type":"string","minLength":min,"maxLength":max})
+fn string() -> Value {
+    json!({"type":"string","minLength":1})
 }
 fn identifier_schema() -> Value {
-    string(1, 160)
+    string()
 }
 fn number(nullable: bool) -> Value {
-    json!({"type":if nullable {json!(["number","null"])} else {json!("number")},"minimum":0,"maximum":1e15})
+    json!({"type":if nullable {json!(["number","null"])} else {json!("number")},"minimum":0})
 }
 fn rule_schema(op: &str, args: Value) -> Value {
     // arguments() is shared with the read adapter: omitted/unused arguments cannot leak in.
@@ -164,9 +164,9 @@ fn rule_schema(op: &str, args: Value) -> Value {
             .iter()
             .all(|key| args.get(*key).is_some())
     );
-    let mut properties = json!({"id":identifier_schema(),"label":string(1,1000),
+    let mut properties = json!({"id":identifier_schema(),"label":string(),
         "op":{"type":"string","enum":[op]},
-        "citation_ids":{"type":"array","items":identifier_schema(),"minItems":1,"maxItems":30}});
+        "citation_ids":{"type":"array","items":identifier_schema(),"minItems":1}});
     properties
         .as_object_mut()
         .unwrap()
@@ -179,13 +179,13 @@ fn value_schema(def: &Value) -> Value {
     }
     match def["type"].as_str().unwrap() {
         "boolean" => json!({"type":"boolean"}),
-        "number" if def["integer"] == true => json!({"type":"integer","minimum":0,"maximum":1e15}),
+        "number" if def["integer"] == true => json!({"type":"integer","minimum":0}),
         "number" => number(false),
         "enum" => {
             json!({"type":"string","enum":def["options"].as_array().unwrap().iter().map(|v|v["value"].clone()).collect::<Vec<_>>()})
         }
         "date" => json!({"type":"string","description":"An actual YYYY-MM-DD calendar date."}),
-        _ => string(1, 3000),
+        _ => string(),
     }
 }
 
@@ -246,9 +246,9 @@ pub fn schema() -> Value {
         }
     }
     let term = object(
-        json!({"field":{"type":"string","enum":numeric},"factor":{"type":"number","exclusiveMinimum":0,"maximum":1e6}}),
+        json!({"field":{"type":"string","enum":numeric},"factor":{"type":"number","exclusiveMinimum":0}}),
     );
-    let terms = json!({"type":"array","items":term,"minItems":1,"maxItems":20});
+    let terms = json!({"type":"array","items":term,"minItems":1});
     variants.push(rule_schema(
         "compare",
         json!({"left":terms,"right":terms,"relation":{"type":"string","enum":["lte","gte"]}}),
@@ -260,18 +260,21 @@ pub fn schema() -> Value {
         .filter(|(_, def)| def["type"] == "date")
         .map(|(name, _)| name.clone())
         .collect();
-    variants.push(rule_schema("min_days",json!({"field":{"type":"string","enum":dates},"days":{"type":"integer","minimum":0,"maximum":36600}})));
-    variants.push(rule_schema("manual", json!({"note":string(1,5000)})));
-    let mut locator = string(1, 1000);
+    variants.push(rule_schema(
+        "min_days",
+        json!({"field":{"type":"string","enum":dates},"days":{"type":"integer","minimum":0}}),
+    ));
+    variants.push(rule_schema("manual", json!({"note":string()})));
+    let mut locator = string();
     locator["type"] = json!(["string", "null"]);
     let citation = object(json!({"id":identifier_schema(),
         "source_url":{"type":"string","description":"Exactly one supplied current source URL."},
-        "locator":locator,"quote":string(1,10000)}));
+        "locator":locator,"quote":string()}));
     object(json!({"schema_version":{"type":"integer","enum":[3]},
-        "title":string(1,500),"summary":string(1,10000),
+        "title":string(),"summary":string(),
         "status":{"type":"string","enum":["open","forthcoming","closed","unknown"]},
         "opens_on":{"type":["string","null"],"description":"YYYY-MM-DD; null if unknown."},
         "closes_at":{"type":["string","null"],"description":"Application deadline as RFC3339 with explicit timezone; null if unknown. Never invent time/timezone."},
-        "requirements":{"type":"array","items":{"anyOf":variants},"maxItems":200},
-        "citations":{"type":"array","items":citation,"maxItems":300}}))
+        "requirements":{"type":"array","items":{"anyOf":variants}},
+        "citations":{"type":"array","items":citation}}))
 }
