@@ -257,37 +257,57 @@ fn prepare(client: &Client, notice: &Notice, options: &RunOptions) -> Result<Vec
             continue;
         }
         let (bytes, server_mime) = download(client, &document.url, options)?;
-        let mime = sniff_type(&bytes).unwrap_or("application/octet-stream");
         ensure!(
             !server_mime.starts_with("text/html")
                 && !bytes.starts_with(b"<html")
                 && !bytes.starts_with(b"<!DOCTYPE html"),
             "Attachment returned HTML instead of an original document"
         );
-        let hash = sha256(&bytes);
-        let path = options.cache_dir.join(&hash);
-        if !path.exists() || sha256(&std::fs::read(&path)?) != hash {
-            std::fs::write(&path, &bytes)?;
-        }
-        let filename = if document.filename.trim().is_empty() {
-            format!(
-                "document.{}",
-                if mime == "application/pdf" {
-                    "pdf"
-                } else {
-                    "image"
-                }
-            )
+        // Regione portals bundle the bando PDFs inside zip archives served as
+        // application/octet-stream; expand them so the model actually sees them.
+        let files: Vec<(String, Vec<u8>)> = if bytes.starts_with(b"PK\x03\x04") {
+            let mut expanded: Vec<(String, Vec<u8>)> = unzip_pdfs(&bytes)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(name, data)| (format!("{}/{}", document.filename, name), data))
+                .collect();
+            if expanded.is_empty() {
+                // Unreadable archive or no PDFs inside: keep the archive itself as an
+                // unsupported document so the review path flags it instead of
+                // silently dropping it.
+                expanded.push((document.filename.clone(), bytes));
+            }
+            expanded
         } else {
-            document.filename.clone()
+            vec![(document.filename.clone(), bytes)]
         };
-        documents.push(DocumentVersion {
-            url: document.url.clone(),
-            filename,
-            mime_type: mime.into(),
-            sha256: hash,
-            bytes: bytes.len() as u64,
-        });
+        for (filename, data) in files {
+            let mime = sniff_type(&data).unwrap_or("application/octet-stream");
+            let hash = sha256(&data);
+            let path = options.cache_dir.join(&hash);
+            if !path.exists() || sha256(&std::fs::read(&path)?) != hash {
+                std::fs::write(&path, &data)?;
+            }
+            let filename = if filename.trim().is_empty() {
+                format!(
+                    "document.{}",
+                    if mime == "application/pdf" {
+                        "pdf"
+                    } else {
+                        "image"
+                    }
+                )
+            } else {
+                filename
+            };
+            documents.push(DocumentVersion {
+                url: document.url.clone(),
+                filename,
+                mime_type: mime.into(),
+                sha256: hash,
+                bytes: data.len() as u64,
+            });
+        }
     }
     ensure!(
         has_source_text
@@ -312,6 +332,43 @@ fn sniff_type(bytes: &[u8]) -> Option<&'static str> {
     } else {
         None
     }
+}
+/// Extract readable PDFs from a zip archive. Skips non-PDF entries, entries that
+/// fail to decompress, and oversized files (zip-bomb guard).
+fn unzip_pdfs(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
+    const MAX_ENTRY_BYTES: u64 = 10 * 1024 * 1024;
+    const MAX_TOTAL_BYTES: u64 = 50 * 1024 * 1024;
+    let mut archive =
+        zip::ZipArchive::new(std::io::Cursor::new(bytes)).context("Unreadable zip archive")?;
+    let mut out = Vec::new();
+    let mut total = 0u64;
+    for i in 0..archive.len() {
+        let entry = archive.by_index(i).context("Unreadable zip entry")?;
+        if entry.is_dir() || total >= MAX_TOTAL_BYTES {
+            continue;
+        }
+        let name = entry.name().map(|s| s.into_owned()).unwrap_or_default();
+        if !name.to_lowercase().ends_with(".pdf") {
+            continue;
+        }
+        let mut buf = Vec::new();
+        entry
+            .take(MAX_ENTRY_BYTES + 1)
+            .read_to_end(&mut buf)
+            .context("Unreadable zip entry")?;
+        if buf.len() as u64 > MAX_ENTRY_BYTES || !buf.starts_with(b"%PDF-") {
+            continue;
+        }
+        total += buf.len() as u64;
+        let filename = name
+            .rsplit(['/', '\\'])
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("document.pdf")
+            .to_string();
+        out.push((filename, buf));
+    }
+    Ok(out)
 }
 fn validate_url(value: &str, options: &RunOptions) -> Result<Url> {
     let url = Url::parse(value)?;
@@ -387,6 +444,27 @@ fn download(client: &Client, value: &str, options: &RunOptions) -> Result<(Vec<u
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    #[test]
+    fn zip_expansion_extracts_pdfs() {
+        // Build a small zip in memory: one pdf, one txt, one oversized entry name.
+        let mut buf = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opts = zip::write::SimpleFileOptions::default();
+            w.start_file("avviso.pdf", opts).unwrap();
+            w.write_all(b"%PDF-1.4 fake").unwrap();
+            w.start_file("note.txt", opts).unwrap();
+            w.write_all(b"hello").unwrap();
+            w.finish().unwrap();
+        }
+        let out = unzip_pdfs(&buf).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "avviso.pdf");
+        assert!(out[0].1.starts_with(b"%PDF-"));
+        // Non-zip bytes fail to open as an archive (the caller checks magic first).
+        assert!(unzip_pdfs(b"%PDF-1.4 fake").is_err());
+    }
     #[test]
     fn fingerprints_ignore_document_order() {
         let n = Notice {
