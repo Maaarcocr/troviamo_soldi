@@ -47,8 +47,33 @@ pub fn run(
     };
     let mut seen = HashSet::new();
     let mut work_items: Vec<WorkItem> = Vec::new();
-    // Phase 1: serial preparation (DB reads/writes, document download)
-    for notice in notices {
+    // Phase 1a: download + prepare documents in parallel (I/O bound, no DB access).
+    // The portal downloads are slow; doing them serially was the bottleneck.
+    let mut unique: Vec<&Notice> = Vec::new();
+    {
+        let mut seen_ids = HashSet::new();
+        for notice in &notices {
+            if seen_ids.insert(notice.id.clone()) {
+                unique.push(notice);
+            }
+        }
+    }
+    let io_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(8)
+        .thread_name(|i| format!("dl-{i}"))
+        .build()
+        .context("Failed to build download thread pool")?;
+    let downloaded: Vec<(&Notice, Result<Vec<DocumentVersion>>)> = io_pool.install(|| {
+        unique
+            .par_iter()
+            .map(|notice| {
+                let result = prepare(client, notice, options);
+                (*notice, result)
+            })
+            .collect()
+    });
+    // Phase 1b: serial DB reads/writes and request building.
+    for (notice, prepared) in downloaded {
         if summary.processed >= options.limit {
             break;
         }
@@ -57,7 +82,6 @@ pub fn run(
         }
         ensure!(!notice.id.is_empty(), "Invalid notice ID");
         let previous = store.previous(&notice.id)?;
-        let prepared = prepare(client, &notice, options);
         let documents = match prepared {
             Ok(docs) => docs,
             Err(error) => {
