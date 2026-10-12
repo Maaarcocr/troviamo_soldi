@@ -154,12 +154,15 @@ pub fn run(
         });
     }
 
-    // Phase 2: parallel AI calls (rayon)
+    // Phase 2: parallel AI calls. I/O bound (waiting on the model API), so use the
+    // wide thread pool, not rayon's default CPU-count pool (2 threads here).
     let model_client = model.context("Model client missing for non-dry run")?;
-    let responses: Vec<_> = work_items
-        .par_iter()
-        .map(|w| model_client.send(&w.body))
-        .collect();
+    let responses: Vec<_> = io_pool.install(|| {
+        work_items
+            .par_iter()
+            .map(|w| model_client.send(&w.body))
+            .collect()
+    });
 
     // Phase 3: serial result processing (DB writes)
     for (work_item, response) in work_items.into_iter().zip(responses.into_iter()) {
