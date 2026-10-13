@@ -1,5 +1,5 @@
 //! Small, read-only, server-rendered interface. No browser credentials or JavaScript.
-use crate::{engine, store::Store};
+use crate::{engine, research_store::ResearchStore, research_web, store::Store};
 use anyhow::Result;
 use chrono::Utc;
 use serde_json::{Value, json};
@@ -12,7 +12,11 @@ const CSP: &str = "default-src 'none'; style-src 'self'; form-action 'self'; bas
 /// The caller defaults to 127.0.0.1. This is an unauthenticated local interface,
 /// not a public deployment; all routes are GET-only and perform no model calls.
 pub fn serve(db_path: &Path, bind: &str) -> Result<()> {
-    let store = Store::open(db_path)?;
+    // Initialize the schema once, then enforce read-only connections for every GET.
+    drop(Store::open(db_path)?);
+    drop(ResearchStore::open(db_path)?);
+    let store = Store::open_read_only(db_path)?;
+    let research = ResearchStore::open_read_only(db_path)?;
     let server = Server::http(bind).map_err(|e| anyhow::anyhow!("Cannot listen on {bind}: {e}"))?;
     eprintln!("Read-only funding UI: http://{bind} (no authentication; keep it local)");
     for request in server.incoming_requests() {
@@ -33,6 +37,12 @@ pub fn serve(db_path: &Path, bind: &str) -> Result<()> {
                 "Interfaccia di sola lettura: sono consentite soltanto richieste GET.",
                 request.url().starts_with("/api/"),
             )
+        } else if let Some(reply) = research_web::route(&store, &research, request.url()) {
+            Reply {
+                status: reply.status,
+                content_type: reply.content_type,
+                body: reply.body,
+            }
         } else {
             route(&store, request.url())
         };
@@ -114,7 +124,10 @@ fn route(store: &Store, target: &str) -> Reply {
             body: CSS.into(),
         };
     }
-    if !matches!(path, "/" | "/api/municipalities" | "/api/opportunities") {
+    if !matches!(
+        path,
+        "/" | "/archive" | "/api/municipalities" | "/api/opportunities"
+    ) {
         return Reply::error(404, "Questa pagina non esiste.", api);
     }
     if path == "/api/municipalities" {
@@ -415,7 +428,7 @@ fn state_label(state: &str) -> (&'static str, &'static str) {
 fn render(view: &View) -> String {
     let mut body = String::with_capacity(32_000);
     body.push_str("<a class=\"skip\" href=\"#opportunita\">Vai ai bandi</a><header class=\"topbar\"><div class=\"shell nav\"><a class=\"brand\" href=\"/\"><span class=\"brand-mark\" aria-hidden=\"true\">c</span>comuni<span class=\"brand-light\"> / bandi</span></a><span class=\"local\"><span aria-hidden=\"true\">●</span> Archivio locale · sola lettura</span></div></header><main class=\"shell\"><section class=\"intro\"><p class=\"eyebrow\">FONDI, CONTESTO, EVIDENZE</p><h1>Le opportunità partono<br>dal tuo Comune.</h1><p class=\"lede\">Un punto di partenza per trovare i bandi, capire i requisiti e sapere che cosa manca prima di candidarsi.</p></section>");
-    body.push_str("<section class=\"context panel\" aria-labelledby=\"contesto\"><div class=\"section-title\"><div><p class=\"eyebrow\">IL CONTESTO</p><h2 id=\"contesto\">Comune e progetto</h2></div><span class=\"quiet\">Nessun dato viene inviato al modello da questa pagina</span></div><div class=\"filters\"><form method=\"get\" action=\"/\"><label for=\"municipality\">Comune</label><div class=\"input-row\"><select id=\"municipality\" name=\"municipality\">");
+    body.push_str("<section class=\"context panel\" aria-labelledby=\"contesto\"><div class=\"section-title\"><div><p class=\"eyebrow\">IL CONTESTO</p><h2 id=\"contesto\">Comune e progetto</h2></div><span class=\"quiet\">Nessun dato viene inviato al modello da questa pagina</span></div><div class=\"filters\"><form method=\"get\" action=\"/archive\"><label for=\"municipality\">Comune</label><div class=\"input-row\"><select id=\"municipality\" name=\"municipality\">");
     let selected_id = view
         .municipality
         .as_ref()
@@ -435,7 +448,7 @@ fn render(view: &View) -> String {
             escape(text(municipality, "provinceAbbreviation"))
         );
     }
-    body.push_str("</select><button type=\"submit\" class=\"secondary\">Scegli Comune</button></div><p class=\"help\">Cambiare Comune azzera il progetto selezionato.</p></form><form method=\"get\" action=\"/\"><label for=\"project\">Progetto</label><div class=\"input-row\">");
+    body.push_str("</select><button type=\"submit\" class=\"secondary\">Scegli Comune</button></div><p class=\"help\">Cambiare Comune azzera il progetto selezionato.</p></form><form method=\"get\" action=\"/archive\"><label for=\"project\">Progetto</label><div class=\"input-row\">");
     let _ = write!(
         body,
         "<input type=\"hidden\" name=\"municipality\" value=\"{}\"><select id=\"project\" name=\"project\"><option value=\"\">Solo dati del Comune</option>",

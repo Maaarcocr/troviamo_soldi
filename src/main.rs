@@ -57,6 +57,38 @@ enum Command {
         #[arg(long)]
         retry_failed: bool,
     },
+    /// Research current opportunities with one persistent, tool-using Rig agent.
+    Research {
+        #[arg(long, default_value = "089014")]
+        municipality: String,
+        #[arg(
+            long,
+            default_value = "Find current funding that this municipality could realistically pursue. Research missing public facts, save evidence and useful assessments, and identify concrete next actions."
+        )]
+        objective: String,
+        #[arg(long, default_value = "var/research")]
+        workspace: PathBuf,
+        /// Resume this saved job, or omit to start a new job.
+        #[arg(long)]
+        job: Option<String>,
+        /// Override FUNDING_RESEARCH_MODEL; defaults to the existing OpenRouter model.
+        #[arg(long)]
+        model: Option<String>,
+        /// Explicitly permit billable provider/search requests with externally configured keys.
+        #[arg(long)]
+        allow_paid: bool,
+        /// Optional operator-selected checkpoint budget, not an eligibility limit.
+        #[arg(long)]
+        max_model_turns: Option<usize>,
+    },
+    /// Read a saved research checkpoint and trace without making requests or changing it.
+    ResearchStatus {
+        #[arg(long)]
+        job: String,
+        /// Optional new private JSON file; never overwrites an existing file.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Discover source records without making model calls.
     Discover {
         #[arg(long, default_value = "config/sources.json")]
@@ -220,6 +252,13 @@ fn reject_database_output(db: &Path, out: Option<&Path>) -> Result<()> {
 /// Run before writer lock, initialization, seeding, configuration, or HTTP setup.
 fn read_only_command(cli: &Cli) -> Result<bool> {
     match &cli.command {
+        Command::ResearchStatus { job, out } => {
+            reject_database_output(&cli.db, out.as_deref())?;
+            let store = funding_rust::research_store::ResearchStore::open_read_only(&cli.db)?;
+            let state = store.load_job(job)?.context("Unknown research job")?;
+            write_diagnostic(&state, out.as_deref())?;
+            Ok(true)
+        }
         Command::ExportAttempts { limit, out } => {
             reject_database_output(&cli.db, out.as_deref())?;
             ensure!(
@@ -254,6 +293,57 @@ fn main() -> Result<()> {
     let mut store = Store::open(&cli.db)?;
     store.seed()?;
     match cli.command {
+        Command::Research {
+            municipality,
+            objective,
+            workspace,
+            job,
+            model,
+            allow_paid,
+            max_model_turns,
+        } => {
+            ensure!(
+                allow_paid,
+                "Research needs explicit --allow-paid and externally configured provider/search credentials. No model call made."
+            );
+            ensure!(
+                max_model_turns != Some(0),
+                "--max-model-turns must be positive"
+            );
+            let municipality_context = store
+                .municipalities()?
+                .into_iter()
+                .find(|entry| entry["istatCode"].as_str() == Some(municipality.as_str()))
+                .with_context(|| format!("Unknown municipality ISTAT code: {municipality}"))?;
+            let run_id = job.unwrap_or_else(|| {
+                format!(
+                    "research-{}-{}",
+                    municipality,
+                    chrono::Utc::now().timestamp_millis()
+                )
+            });
+            ensure!(
+                !run_id.trim().is_empty() && run_id.len() <= 200,
+                "Invalid job ID"
+            );
+            let model = model
+                .or_else(|| std::env::var("FUNDING_RESEARCH_MODEL").ok())
+                .unwrap_or_else(|| "openai/gpt-6-luna".into());
+            let result = funding_rust::research_agent::run(
+                &funding_rust::research_agent::ResearchAgentOptions {
+                    db_path: cli.db.clone(),
+                    workspace,
+                    run_id,
+                    municipality_id: municipality,
+                    municipality_context,
+                    objective,
+                    model,
+                    allow_paid,
+                    max_model_turns,
+                },
+            )?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
         Command::Init => println!("Initialized {}", cli.db.display()),
         Command::Status => println!("{}", serde_json::to_string_pretty(&store.stats()?)?),
         Command::ImportFacts { file } => {
@@ -324,7 +414,10 @@ fn main() -> Result<()> {
             )?;
             println!("{}", serde_json::to_string_pretty(&summary)?);
         }
-        Command::Serve { .. } | Command::ExportAttempts { .. } | Command::Replay { .. } => {
+        Command::Serve { .. }
+        | Command::ExportAttempts { .. }
+        | Command::Replay { .. }
+        | Command::ResearchStatus { .. } => {
             unreachable!()
         }
     }

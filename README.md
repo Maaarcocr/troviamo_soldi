@@ -1,17 +1,24 @@
 # troviamo_soldi
 
-One Rust binary, SQLite, and a read-only Italian web UI for screening funding calls against Sicilian municipalities.
+A Rust research assistant for finding funding that a municipality can actually pursue. One Rig agent discovers current calls, follows official documents, investigates missing facts, and records its work in SQLite and a local research workspace. Pachino (ISTAT `089014`) is the default; another municipality uses the same tools and knowledge structure.
 
-1. Discover notices and download their original files.
-2. Skip a notice if its source content and file hashes are unchanged.
-3. For a new or changed notice, send the current text and all supported originals to OpenRouter `openai/gpt-6-luna`, with max reasoning and strict JSON. Make one request at most.
-4. Save the facts and actual reported cost. Rust filters municipalities locally, without another AI call.
+The research path replaces the fixed “one PDF batch → extracted fields → universal rules” approach. The previous ingestion path is retained for existing data and diagnostics, without silently treating its imports as researched opportunities.
 
-No OCR, PDF text extraction, classifier stage, model eligibility verdict, larger-model fallback, or automatic paid retry. A changed notice is self-contained: previous model output is never fed back as evidence.
+## What the agent does
 
-## Run
+- Searches for current calls, rather than processing the oldest stored IDs first.
+- Opens official pages, follows relevant documents and amendments, and reads originals when needed.
+- Checks which documents actually belong to a call. Nearby “related” articles do not establish its terms.
+- Researches missing municipal facts and saves dated, scoped evidence for reuse.
+- Distinguishes the Comune, associations, specific sites and proposed projects.
+- Separates applicant eligibility from whether a real project is ready to apply.
+- Saves useful results as it works and resumes from persisted checkpoints.
 
-Install stable Rust, then:
+The core records are calls, evidence, facts and assessments. There is no fixed catalogue of every possible eligibility fact. The agent reuses existing fact names where meanings match and can add a genuinely new one. Rust handles persistence, provenance checks, simple calculations, date handling and access boundaries; the agent interprets the documents. There is no QuickJS or general-purpose shell/SQL tool.
+
+## Build and view
+
+Install the Rust version required by `Cargo.toml`:
 
 ```sh
 cargo build --release --locked
@@ -19,104 +26,62 @@ cargo build --release --locked
 ./target/release/funding-rust serve
 ```
 
-Open http://127.0.0.1:8080. The initial archive is empty. The app bundles 391 Sicilian municipalities and 511 previously collected official evidence records; it does not load example grants as real opportunities.
+Open http://127.0.0.1:8080. The main view shows researched opportunities, their amount and qualifications, why they may fit, application and accreditation deadlines, essential unknowns, and next actions. It does not populate the feed with example calls. The previous extracted archive remains separately available at `/archive`.
+
+The UI is read-only and makes no model calls. It binds loopback by default and has no user authentication. Use your own authenticated HTTPS proxy before exposing it publicly. Keys stay in server configuration, never in browser code.
+
+## Run real research
+
+Configure `OPENROUTER_API_KEY` externally on the server. The default uses OpenRouter’s server-side web-search tool with that same key, alongside the agent’s local source and memory tools. Never commit credentials or paste them into a research objective. `--allow-paid` is an explicit operator opt-in; building, serving, and reading existing records do not spend model credits.
 
 ```sh
-# Discover source content, without AI calls:
-./target/release/funding-rust discover --out notices.json
+# Externally configure OPENROUTER_API_KEY first.
+./target/release/funding-rust research --allow-paid
 
-# After configuring OPENROUTER_API_KEY and an OpenRouter spending limit:
-./target/release/funding-rust run --limit 5 --allow-paid
+# Use another model without code changes.
+./target/release/funding-rust research --allow-paid --model YOUR_OPENROUTER_MODEL
 
-# Use a populated discovery export or manual input instead:
-./target/release/funding-rust run --input notices.json --limit 5 --allow-paid
+# Operator-chosen checkpoint budget; this is a call count, not a dollar cap.
+./target/release/funding-rust research --allow-paid --max-model-turns 20
 
-./target/release/funding-rust status
+# Inspect actual checkpoint, tool trace and reported cost without requests.
+./target/release/funding-rust research-status --job JOB_ID --out research-trace.json
+
+# Continue the job ID printed by the earlier run.
+./target/release/funding-rust research --allow-paid --job JOB_ID
 ```
 
-`daily` is an alias of `run`. `--limit` is mandatory and counts attempted **bandi**, including input/download/provider failures and review cases. Unchanged cached versions consume no slot and make no model call. Every attempted notice makes at most one model request. Document preparation is bounded by the remaining notice limit; cached candidates are skipped before advancing further. Completed model responses are saved immediately while other requests are still pending. A writer lock prevents overlapping CLI runs.
+The default model preserves the existing configuration choice, `openai/gpt-6-luna`; `FUNDING_RESEARCH_MODEL` or `--model` overrides it. Availability, capability and pricing must be checked with your provider before a live pilot. The application does not claim that this default has passed a research-quality evaluation.
 
-`run` requires explicit `--allow-paid` authorization or a test-only loopback `--mock-url`; these options cannot be combined. Mock requests never send an API key. Use `discover` to inspect source records without model calls, or the offline diagnostics below to inspect saved attempts.
+There is no hidden tiny output-token cap or model-request timeout. Optional `--max-model-turns` is a transparent operator limit. Reaching it means **research incomplete**, not ineligible. Provider-side spending limits are still necessary: a model call count is not a monetary budget. OpenRouter server-side search also consumes provider credits; an optional external search/rendering service has separate charges. Reported costs are retained; missing cost is unknown, not zero.
 
-The limit counts notices, **not money**. Requests keep max reasoning effort and omit output-token caps: [OpenRouter forwards omitted parameters without injecting a value](https://openrouter.ai/docs/api_reference/parameters), so provider defaults and model limits still apply. The app sets no model-request timeout or response-size cap. Incomplete output is saved for inspection, not retried. A provider timeout or interrupted request may have been billed: `--retry-failed` explicitly retries failed, interrupted or review versions and can duplicate charges. Do not use it merely to inspect a failure.
+The job stores the conversation/driver checkpoint and tool results. An interrupted or failed provider request may already have been billed. Do not blindly launch a second job to retry it. Review the saved job state before resuming. Persistence does not provide a distributed exactly-once billing guarantee.
 
-## Source input
+## Source tools and optional rendering
 
-Configure adapters and download hosts in `config/sources.json`; `examples/notices.json` shows the manual notice format.
+Web search runs through [OpenRouter’s server-side search tool](https://openrouter.ai/docs/guides/features/server-tools/web-search), with the existing OpenRouter key. Results are discovery leads; the agent still fetches the authoritative pages and documents before recording evidence. If you prefer a separate search service, `BRAVE_SEARCH_API_KEY` enables the optional direct Brave tool. `FUNDING_SEARCH_ENDPOINT` can point to a Brave-compatible public HTTPS endpoint.
 
-Each notice needs nonblank `source_text` or original documents. A bare ID/title/URL is not sufficient and is rejected before a model call. Use the populated `discover` export, paste the actual source text/HTML/JSON, or supply the original file URLs. The app does not fetch a bare URL and assume a portal shell contains the call. Supplied HTML is accepted without language, length or JavaScript-content guessing.
+Static pages are fetched and archived directly. PDF and image originals are delivered to the selected model, so its provider must support native PDFs/images. DOCX/ODT text can be read from their XML; layout and embedded images are not thereby verified. Unsupported formats remain explicit research gaps.
 
-Original bytes are SHA-256 hashed and cached under `var/files/<hash>`. PDFs and PNG/JPEG/WebP/GIF are sent directly as base64 originals. ZIP archives are expanded into original PDF/image inputs while retaining the complete archive hash and full member paths. Unsupported members such as DOCX/P7M remain coverage gaps. Archive entries over 10 MiB, entries beyond the 50 MiB total decompression budget, and unreadable members are explicitly flagged for review; they are never silently omitted. Files are not converted or OCRed. If there is no source text and every file is unsupported, processing stops before a paid request. With usable input plus unsupported files, extraction can proceed but remains under review.
+This first slice does not bundle or install a browser. JavaScript-only pages need an optional isolated renderer: `FUNDING_RENDER_ENDPOINT` accepts `POST {"url":"https://…","network_policy":"public-only"}` and returns `{"final_url":"https://…","html":"…"}`. `FUNDING_RENDER_API_KEY` optionally adds Bearer authentication. The renderer must independently block private-network access on every navigation, redirect and subresource. Without it, the agent receives a clear rendering-unavailable result and must report that limitation. Launching a naïve local Chromium process would bypass the source-fetch network boundary, so that is not done automatically.
 
-Downloads require an allowed HTTPS host, including redirect targets. All supplied source text and supported original files are sent without application size or count caps. Download failure or HTML returned as an attachment stops the notice before a model request. Source fetching retains its transport timeout and redirect-loop protection; provider upload/context limits still apply. Loopback HTTP is only for the test `--mock-url` path.
+## Evidence and reuse
 
-The request includes the current `as_of` time for interpreting dated windows. Time alone does not change the source fingerprint or trigger another call.
+Original sources are content-addressed in the research workspace. Evidence records retain source versions, retrieval time and quotations/locators. Facts have explicit subjects and time scope. An assessment depends on the evidence and facts it used, so relevant changes make it stale rather than silently preserving an old conclusion.
 
-Changed notice text, titles or attachments produce a new fingerprint. All current supported originals are then sent again. Removed originals are flagged for review. This can use more input tokens than sending only an amendment, but avoids carrying a previous model interpretation forward. Identical historical versions reuse their own cached result.
+An official list omitting “Comune di Pachino” says something about that specific list, entity and period. It does not establish a timeless absence of funding; an award to a Pro Loco cannot be attributed to the Comune. Unknown site ownership or project readiness is not false, and a failed search is not a permanent negative cache.
 
-### Coverage
+Date-only deadlines remain date-only. Accreditation and submission are different actions. An open call that admits municipalities is not evidence that a chosen site or proposed project qualifies. Closed calls and unsuccessful imports are not shown as current opportunities.
 
-- EU SEDIA: current official index, English open/forthcoming records, types 1/2/8. Child cascade calls keep their own IDs and are labelled separately from parent topics/projects. Status/type codes are decoded from the official FACET API. Conflicting source dates and narratives are retained.
-- EuroInfoSicilia: audited Bandi category union, including closed results/amendments. Article HTML is checked because WordPress bodies can omit attachment links.
-- National sources: explicit/manual feed additions.
+Retrieved content is untrusted. The model has only read-only public-source tools, workspace-limited reads, calculation tools, and typed research-memory operations. It cannot execute arbitrary commands, issue SQL, send messages, submit applications or modify server settings. Network controls reject non-public targets and unsafe redirects; filesystem tools reject path traversal and symlink escapes.
 
-This is not a complete all-Italy or all-EU catalogue. External cascade sites are not recursively crawled. External annex hosts outside the configured allowlist are not fetched; some real annexes therefore remain outside coverage. Source errors fail discovery rather than silently claim a complete refresh. A small AI limit still requires configured source discovery. Absence from a listing does not close a call, and an article can contain more than one opportunity.
+## Honest verification
 
-## Facts and municipality screening
+This implementation is not proof of research quality. Compilation, linting and checks of real SQLite/filesystem behavior establish software properties only. No fake model replies or synthetic research scenarios are used to claim discovery or interpretation quality.
 
-Luna supplies compact source facts, not an eligibility decision. Descriptive budgets and scoring information belong in `summary`. `requirements` contains only mandatory applicant, project or application conditions.
+A meaningful pilot needs actual provider credentials and an explicit spending budget. Run it against the research goal, inspect the real tool trace and source passages, check whether it found useful current calls, and challenge unsupported positive and negative conclusions. Record actual cost and what information it reused. Useful hand-review questions include whether it kept related attachments separate, distinguished the applicant from a project/site, and revisited an unresolved fact after new evidence arrived. Do not preload desired conclusions and call that independent discovery.
 
-```json
-{"id":"country","label":"Sede in Estonia","op":"one_of","field":"entity.country","values":["EE"],"citation_ids":["c1"]}
-```
-
-Conditions are ANDed. The six operators are `equals`, `one_of`, `range`, `compare`, `min_days` and `manual`. Each structured condition must be necessary on its own; alternatives that cannot be expressed faithfully stay together in a manual condition. Rust derives evidence scope from the field catalogue; the model never supplies a scope or global blocker.
-
-Countries use ISO alpha-2 codes; applicant types and regions use the catalogue's identifiers. Broad public-body eligibility uses `entity.publicBody=true`. Financial numeric fields use EUR; unsupported currencies/categories remain manual. Unknown values stay unknown, never false or invented zeros.
-
-The JSON contract has no application-imposed upper bounds on text lengths, list sizes or numeric values. Types, nonblank text, valid dates and references are still checked. Every requirement references supplied source citations. A quote can be a single literal value such as `30500`; it must be nonblank and free of unsafe controls. An unknown locator is `null`. An empty extraction may have no citations and remains under review. Duplicate JSON keys, invalid types, missing references and unsupported source URLs are rejected. Quotes are never padded, repaired or independently verified against PDFs. Valid JSON does not prove a correct interpretation.
-
-`extracted` means usable source facts were saved without an input-coverage failure, empty requirement list, or missing applicant-type condition. Country, region and population conditions alone do not establish who may apply. It does **not** mean eligible grants. Unknown dates and individual manual conditions are reported separately. Rust's municipality matcher produces excluded, ineligible, screening-match or review results. Definite applicant mismatches can exclude a call despite unrelated unknown project facts; missing evidence never establishes a positive match.
-
-```sh
-# Local municipality/project facts, without AI calls:
-./target/release/funding-rust import-facts examples/facts.json
-```
-
-Imports are always `user_declared` and cannot overwrite bundled official evidence. Facts are scoped to municipality, project and, where needed, call ID. Historical, stale, contradictory or self-declared evidence cannot become verified eligibility. Population basis/reference dates and current financial status remain distinct from estimates and historical lists. The UI is read-only.
-
-## Inspect failures without spending again
-
-```sh
-./target/release/funding-rust --db var/funding.sqlite export-attempts --limit 10 --out attempts.json
-./target/release/funding-rust replay attempts.json --out replay.json
-```
-
-Export opens SQLite read-only. Replay reads only its input file: no database writes, downloads or model calls. Neither overwrites an existing output file. Exports contain original provider responses, source/version metadata and usage; keep them private.
-
-Replay separates provider failures, truncation, invalid JSON, invalid extraction and unresolved facts. Citation URL validation needs independent source metadata; a bare SQL export or historical record without its notice snapshot is diagnosis-only. No replay result verifies quotations or imports recovered facts.
-
-Existing SQLite records, raw responses and review flags remain intact. Legacy extraction shapes are read through internal compatibility adapters. New model responses use version 3; a small storage adapter retains the existing version-2 shape for Rust coverage warnings. New successful rows use `extracted`; old `screened` rows remain readable. Upgrading does not itself issue calls, clean corrupted quotes or rewrite stored results. This release removes generated warning prose from SEDIA source text, so a later explicitly paid run can see affected EU records as changed and re-extract them, bounded by `--limit`. There is no uncapped migration or automatic re-extraction.
-
-## Actual cost
-
-Every response stores its generation ID, provider, raw response and reported usage, including invalid/truncated responses. Reports show prompt/completion/reasoning tokens, returned `usage.cost` in USD, and mean actual cost per called/processed notice when every call reports cost. Reasoning is already included in completion tokens and is not added twice.
-
-Missing cost is unknown, never zero. Any missing cost makes averages `null` and labels the returned-cost sum a partial subtotal. No price-table estimate replaces actual charges. Saved generation IDs can be reconciled with OpenRouter; the app does not automatically retry to recover them.
-
-## Storage and serving
-
-- `GET /`
-- `GET /api/municipalities`
-- `GET /api/opportunities?municipality=088001&project=school&archive=1`
-
-The web UI escapes text, restricts links to HTTP(S), sets a restrictive CSP and accepts only GET. It binds loopback by default and has no authentication/account separation. Keep it local or behind your own authenticated HTTPS proxy. Closed/ineligible records are hidden unless the archive checkbox is enabled; uncertain results stay visible. The web view does not refresh source documents.
-
-Use `--db /path/funding.sqlite` and `run --cache /path/files` for persistent storage. Back up SQLite with its backup API or stop writers first; WAL sidecars may contain recent writes. Back up cached originals too. SQLite is bundled, and `Cargo.lock` is committed.
-
-`deploy/` contains optional systemd examples. Inspect paths, protect credentials, set a spending cap and enable scheduling yourself. Nothing here installs, deploys or schedules the app automatically.
-
-## Verify
+No paid research, server deployment, or live quality validation is implied by publishing the code.
 
 ```sh
 cargo fmt --check
@@ -124,8 +89,10 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
 ```
 
-Tests use local HTTP mocks and fixtures, never paid calls. They cover literal short/missing evidence, strict types and references, unknown versus false, local applicant exclusion, direct original bytes, full current input for changed notices, cache reuse, zero-call input failures, call limits, actual/unknown costs, private offline replay and safe HTML. One optional ignored adapter test needs separate `FUNDING_AUDIT_DIR` snapshots.
+## Existing data and operations
 
-Requests select native PDF handling, the `openai` provider family, required-parameter support, no fallback and max-effort Luna. The provider family may include Flex. Unexpected models, parsed-file annotations, refusal, non-stop finish reasons and malformed output remain rejected. Mock tests cannot establish live output quality or future spend; this simplicity pass makes no paid calls.
+The research tables are additive. Existing notices, versions, evidence, original responses and costs remain intact; they are not automatically promoted into new verified assessments. The old CLI and its diagnostic/replay commands remain available for historical inspection, described in [legacy pipeline documentation](docs/legacy-pipeline.md).
 
-Provider references: [PDFs](https://openrouter.ai/docs/guides/overview/multimodal/pdfs), [reasoning](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens), [structured output](https://openrouter.ai/docs/guides/features/structured-outputs), [routing](https://openrouter.ai/docs/guides/routing/provider-selection), [Luna](https://openrouter.ai/openai/gpt-6-luna).
+Use `--db /path/funding.sqlite` and `research --workspace /path/research` for persistent storage. Back up SQLite consistently using its backup API or stop writers first; WAL files can contain recent writes. Back up the research workspace too. Research traces can contain private user-supplied objectives and source data: keep the database, logs and backups private.
+
+Nothing installs services, deploys the app, schedules research, merges a pull request or authorizes provider spend automatically.
