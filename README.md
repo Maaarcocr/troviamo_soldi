@@ -25,9 +25,6 @@ Open http://127.0.0.1:8080. The initial archive is empty. The app bundles 391 Si
 # Discover source content, without AI calls:
 ./target/release/funding-rust discover --out notices.json
 
-# Download/hash at most 5 new or changed notices, without AI calls:
-./target/release/funding-rust run --limit 5 --dry-run
-
 # After configuring OPENROUTER_API_KEY and an OpenRouter spending limit:
 ./target/release/funding-rust run --limit 5 --allow-paid
 
@@ -37,7 +34,9 @@ Open http://127.0.0.1:8080. The initial archive is empty. The app bundles 391 Si
 ./target/release/funding-rust status
 ```
 
-`daily` is an alias of `run`. `--limit` is mandatory and counts attempted **bandi**, including input/download/provider failures and review cases. Unchanged cached versions consume no slot and make no model call. Every attempted notice makes at most one model request. A writer lock prevents overlapping CLI runs.
+`daily` is an alias of `run`. `--limit` is mandatory and counts attempted **bandi**, including input/download/provider failures and review cases. Unchanged cached versions consume no slot and make no model call. Every attempted notice makes at most one model request. Document preparation is bounded by the remaining notice limit; cached candidates are skipped before advancing further. Completed model responses are saved immediately while other requests are still pending. A writer lock prevents overlapping CLI runs.
+
+`run` requires explicit `--allow-paid` authorization or a test-only loopback `--mock-url`; these options cannot be combined. Mock requests never send an API key. Use `discover` to inspect source records without model calls, or the offline diagnostics below to inspect saved attempts.
 
 The limit counts notices, **not money**. Requests keep max reasoning effort and omit output-token caps: [OpenRouter forwards omitted parameters without injecting a value](https://openrouter.ai/docs/api_reference/parameters), so provider defaults and model limits still apply. The app sets no model-request timeout or response-size cap. Incomplete output is saved for inspection, not retried. A provider timeout or interrupted request may have been billed: `--retry-failed` explicitly retries failed, interrupted or review versions and can duplicate charges. Do not use it merely to inspect a failure.
 
@@ -47,7 +46,7 @@ Configure adapters and download hosts in `config/sources.json`; `examples/notice
 
 Each notice needs nonblank `source_text` or original documents. A bare ID/title/URL is not sufficient and is rejected before a model call. Use the populated `discover` export, paste the actual source text/HTML/JSON, or supply the original file URLs. The app does not fetch a bare URL and assume a portal shell contains the call. Supplied HTML is accepted without language, length or JavaScript-content guessing.
 
-Original bytes are SHA-256 hashed and cached under `var/files/<hash>`. PDFs and PNG/JPEG/WebP/GIF are sent directly as base64 originals. DOCX, ZIP, P7M and other unsupported files are retained as coverage gaps; they are not unpacked, converted or OCRed. If there is no source text and every file is unsupported, processing stops before a paid request. With usable input plus unsupported files, extraction can proceed but remains under review.
+Original bytes are SHA-256 hashed and cached under `var/files/<hash>`. PDFs and PNG/JPEG/WebP/GIF are sent directly as base64 originals. ZIP archives are expanded into original PDF/image inputs while retaining the complete archive hash and full member paths. Unsupported members such as DOCX/P7M remain coverage gaps. Archive entries over 10 MiB, entries beyond the 50 MiB total decompression budget, and unreadable members are explicitly flagged for review; they are never silently omitted. Files are not converted or OCRed. If there is no source text and every file is unsupported, processing stops before a paid request. With usable input plus unsupported files, extraction can proceed but remains under review.
 
 Downloads require an allowed HTTPS host, including redirect targets. All supplied source text and supported original files are sent without application size or count caps. Download failure or HTML returned as an attachment stops the notice before a model request. Source fetching retains its transport timeout and redirect-loop protection; provider upload/context limits still apply. Loopback HTTP is only for the test `--mock-url` path.
 
@@ -77,7 +76,7 @@ Countries use ISO alpha-2 codes; applicant types and regions use the catalogue's
 
 The JSON contract has no application-imposed upper bounds on text lengths, list sizes or numeric values. Types, nonblank text, valid dates and references are still checked. Every requirement references supplied source citations. A quote can be a single literal value such as `30500`; it must be nonblank and free of unsafe controls. An unknown locator is `null`. An empty extraction may have no citations and remains under review. Duplicate JSON keys, invalid types, missing references and unsupported source URLs are rejected. Quotes are never padded, repaired or independently verified against PDFs. Valid JSON does not prove a correct interpretation.
 
-`extracted` means usable source facts were saved without an input-coverage failure or empty requirement list. It does **not** mean eligible grants. Unknown dates and individual manual conditions are reported separately. Rust's municipality matcher produces excluded, ineligible, screening-match or review results. Definite applicant mismatches can exclude a call despite unrelated unknown project facts; missing evidence never establishes a positive match.
+`extracted` means usable source facts were saved without an input-coverage failure, empty requirement list, or missing applicant-type condition. Country, region and population conditions alone do not establish who may apply. It does **not** mean eligible grants. Unknown dates and individual manual conditions are reported separately. Rust's municipality matcher produces excluded, ineligible, screening-match or review results. Definite applicant mismatches can exclude a call despite unrelated unknown project facts; missing evidence never establishes a positive match.
 
 ```sh
 # Local municipality/project facts, without AI calls:

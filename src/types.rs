@@ -24,6 +24,11 @@ pub struct Notice {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DocumentVersion {
+    /// Full archive entry path; the URL remains the real downloadable citation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_member: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage_warning: Option<String>,
     pub url: String,
     pub filename: String,
     pub mime_type: String,
