@@ -642,14 +642,7 @@ fn cached_legacy_screened_version_is_not_reprocessed() {
         .unwrap();
     let mut opts = options(&temp, 1);
     opts.retry_failed = true;
-    let summary = pipeline::run(
-        &mut store,
-        &http(),
-        &mock.model(),
-        vec![notice],
-        &opts,
-    )
-    .unwrap();
+    let summary = pipeline::run(&mut store, &http(), &mock.model(), vec![notice], &opts).unwrap();
     assert_eq!(
         (summary.unchanged, summary.processed, summary.calls),
         (1, 0, 0)
@@ -1092,11 +1085,25 @@ fn limit_bounds_downloads_but_cached_notices_do_not_consume_slots() {
         mock.notice("two", &["/two"]),
         mock.notice("three", &["/three"]),
     ];
-    let first = pipeline::run(&mut store, &http(), &mock.model(), notices.clone(), &options(&temp, 1)).unwrap();
+    let first = pipeline::run(
+        &mut store,
+        &http(),
+        &mock.model(),
+        notices.clone(),
+        &options(&temp, 1),
+    )
+    .unwrap();
     assert_eq!(first.calls, 1);
     assert_eq!(*mock.fetches.lock().unwrap(), ["/one"]);
     mock.fetches.lock().unwrap().clear();
-    let second = pipeline::run(&mut store, &http(), &mock.model(), notices, &options(&temp, 1)).unwrap();
+    let second = pipeline::run(
+        &mut store,
+        &http(),
+        &mock.model(),
+        notices,
+        &options(&temp, 1),
+    )
+    .unwrap();
     assert_eq!((second.unchanged, second.calls), (1, 1));
     assert_eq!(*mock.fetches.lock().unwrap(), ["/one", "/two"]);
 }
@@ -1109,12 +1116,28 @@ fn zip_partial_coverage_keeps_original_identity_and_flags_large_and_unsupported_
     let mut large = b"%PDF-1.4".to_vec();
     large.resize(10 * 1024 * 1024 + 1, b'a');
     let notice = mock.notice("zip", &["/bundle.zip"]);
-    let archive = zip_bytes(&[("small.pdf", b"%PDF-1.4 small"), ("large.pdf", &large), ("terms.docx", b"unreadable terms")]);
+    let archive = zip_bytes(&[
+        ("small.pdf", b"%PDF-1.4 small"),
+        ("large.pdf", &large),
+        ("terms.docx", b"unreadable terms"),
+    ]);
     mock.put("/bundle.zip", &archive);
-    let first = pipeline::run(&mut store, &http(), &mock.model(), vec![notice.clone()], &options(&temp, 1)).unwrap();
+    let first = pipeline::run(
+        &mut store,
+        &http(),
+        &mock.model(),
+        vec![notice.clone()],
+        &options(&temp, 1),
+    )
+    .unwrap();
     assert_eq!((first.calls, first.needs_review), (1, 1));
     let documents = store.previous("zip").unwrap().unwrap();
-    assert!(documents.iter().any(|document| document.mime_type == "application/zip" && document.sha256 == pipeline::sha256(&archive)));
+    assert!(
+        documents
+            .iter()
+            .any(|document| document.mime_type == "application/zip"
+                && document.sha256 == pipeline::sha256(&archive))
+    );
     let export = store.export_attempts(1).unwrap();
     let saved = serde_json::to_value(export).unwrap().to_string();
     assert!(saved.contains("large.pdf"));
@@ -1123,8 +1146,22 @@ fn zip_partial_coverage_keeps_original_identity_and_flags_large_and_unsupported_
     assert!(saved.contains("not readable"));
     // Only a skipped member changes, but the full archive identity still changes.
     *large.last_mut().unwrap() = b'b';
-    mock.put("/bundle.zip", &zip_bytes(&[("small.pdf", b"%PDF-1.4 small"), ("large.pdf", &large), ("terms.docx", b"unreadable terms")]));
-    let changed = pipeline::run(&mut store, &http(), &mock.model(), vec![notice], &options(&temp, 1)).unwrap();
+    mock.put(
+        "/bundle.zip",
+        &zip_bytes(&[
+            ("small.pdf", b"%PDF-1.4 small"),
+            ("large.pdf", &large),
+            ("terms.docx", b"unreadable terms"),
+        ]),
+    );
+    let changed = pipeline::run(
+        &mut store,
+        &http(),
+        &mock.model(),
+        vec![notice],
+        &options(&temp, 1),
+    )
+    .unwrap();
     assert_eq!((changed.calls, changed.unchanged), (1, 0));
 }
 
@@ -1134,19 +1171,62 @@ fn zip_members_have_full_paths_and_removed_members_are_reviewed() {
     let temp = TempDir::new().unwrap();
     let mut store = db(&temp);
     let notice = mock.notice("zip", &["/bundle.zip"]);
-    mock.put("/bundle.zip", &zip_bytes(&[("a/terms.pdf", b"%PDF-1.4 A"), ("b/terms.pdf", b"%PDF-1.4 B"), ("chart.png", b"\x89PNG\r\n\x1a\nimage")]));
-    let first = pipeline::run(&mut store, &http(), &mock.model(), vec![notice.clone()], &options(&temp, 1)).unwrap();
+    mock.put(
+        "/bundle.zip",
+        &zip_bytes(&[
+            ("a/terms.pdf", b"%PDF-1.4 A"),
+            ("b/terms.pdf", b"%PDF-1.4 B"),
+            ("chart.png", b"\x89PNG\r\n\x1a\nimage"),
+        ]),
+    );
+    let first = pipeline::run(
+        &mut store,
+        &http(),
+        &mock.model(),
+        vec![notice.clone()],
+        &options(&temp, 1),
+    )
+    .unwrap();
     assert_eq!((first.calls, first.extracted), (1, 1));
     let documents = store.previous("zip").unwrap().unwrap();
-    assert!(documents.iter().any(|d| d.archive_member.as_deref() == Some("a/terms.pdf")));
-    assert!(documents.iter().any(|d| d.archive_member.as_deref() == Some("b/terms.pdf")));
+    assert!(
+        documents
+            .iter()
+            .any(|d| d.archive_member.as_deref() == Some("a/terms.pdf"))
+    );
+    assert!(
+        documents
+            .iter()
+            .any(|d| d.archive_member.as_deref() == Some("b/terms.pdf"))
+    );
     assert!(documents.iter().all(|d| d.url == notice.documents[0].url));
     let request = mock.requests.lock().unwrap()[0].clone();
-    assert!(request["messages"][0]["content"].as_array().unwrap().iter().any(|part| part["type"] == "image_url"));
-    mock.put("/bundle.zip", &zip_bytes(&[("a/terms.pdf", b"%PDF-1.4 A"), ("chart.png", b"\x89PNG\r\n\x1a\nimage")]));
-    let changed = pipeline::run(&mut store, &http(), &mock.model(), vec![notice], &options(&temp, 1)).unwrap();
+    assert!(
+        request["messages"][0]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|part| part["type"] == "image_url")
+    );
+    mock.put(
+        "/bundle.zip",
+        &zip_bytes(&[
+            ("a/terms.pdf", b"%PDF-1.4 A"),
+            ("chart.png", b"\x89PNG\r\n\x1a\nimage"),
+        ]),
+    );
+    let changed = pipeline::run(
+        &mut store,
+        &http(),
+        &mock.model(),
+        vec![notice],
+        &options(&temp, 1),
+    )
+    .unwrap();
     assert_eq!((changed.calls, changed.needs_review), (1, 1));
-    let saved = serde_json::to_value(store.export_attempts(1).unwrap()).unwrap().to_string();
+    let saved = serde_json::to_value(store.export_attempts(1).unwrap())
+        .unwrap()
+        .to_string();
     assert!(saved.contains("Previously supplied files are no longer listed"));
     assert!(saved.contains("b/terms.pdf"));
 }
@@ -1164,12 +1244,16 @@ fn completed_response_is_durable_while_another_model_call_is_pending() {
     let server_thread = thread::spawn(move || {
         let mut held = None;
         for _ in 0..2 {
-            let mut request = server.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+            let mut request = server
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .unwrap();
             let mut raw = String::new();
             request.as_reader().read_to_string(&mut raw).unwrap();
             let body: Value = serde_json::from_str(&raw).unwrap();
             let prompt = body["messages"][0]["content"][0]["text"].as_str().unwrap();
-            let data: Value = serde_json::from_str(prompt.split("INPUT DATA:\n").nth(1).unwrap()).unwrap();
+            let data: Value =
+                serde_json::from_str(prompt.split("INPUT DATA:\n").nth(1).unwrap()).unwrap();
             let facts = json!({"schema_version":3,"title":"Fixture","summary":"Fixture","status":"open","opens_on":null,"closes_at":"2099-01-01T00:00:00Z","requirements":[{"id":"kind","label":"Comune","op":"equals","field":"entity.kind","value":"municipality","citation_ids":["c1"]}],"citations":[{"id":"c1","source_url":data["source_url"],"quote":"municipality","locator":null}]});
             let response = json!({"id":"gen-mock","model":MODEL,"choices":[{"finish_reason":"stop","message":{"content":facts.to_string()}}],"usage":{"cost":0.002}}).to_string();
             if data["title"] == "slow" {
@@ -1183,15 +1267,25 @@ fn completed_response_is_durable_while_another_model_call_is_pending() {
         let (request, response) = held.unwrap();
         request.respond(Response::from_string(response)).unwrap();
     });
-    let notices = ["slow", "fast"].into_iter().map(|id| Notice {
-        id: id.into(), title: id.into(), source_url: format!("{base}/{id}"),
-        source_text: Some("municipality".into()), documents: vec![],
-    }).collect();
+    let notices = ["slow", "fast"]
+        .into_iter()
+        .map(|id| Notice {
+            id: id.into(),
+            title: id.into(),
+            source_url: format!("{base}/{id}"),
+            source_text: Some("municipality".into()),
+            documents: vec![],
+        })
+        .collect();
     let opts = options(&temp, 2);
     let pipeline_path = path.clone();
     let pipeline_thread = thread::spawn(move || {
         let mut store = Store::open(&pipeline_path).unwrap();
-        let model = ModelClient { http: Client::builder().no_proxy().build().unwrap(), endpoint: format!("{base}/chat"), api_key: None };
+        let model = ModelClient {
+            http: Client::builder().no_proxy().build().unwrap(),
+            endpoint: format!("{base}/chat"),
+            api_key: None,
+        };
         pipeline::run(&mut store, &http(), &model, notices, &opts).unwrap()
     });
     ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
@@ -1200,7 +1294,9 @@ fn completed_response_is_durable_while_another_model_call_is_pending() {
     let mut durable = false;
     while std::time::Instant::now() < deadline {
         durable = reader.query_row("SELECT count(*) FROM attempts a JOIN versions v ON v.id=a.version_id WHERE v.notice_id='fast' AND a.response IS NOT NULL AND a.usage LIKE '%0.002%' AND v.extraction IS NOT NULL AND v.state='extracted'", [], |row| row.get::<_, i64>(0)).unwrap() == 1;
-        if durable { break; }
+        if durable {
+            break;
+        }
         thread::sleep(Duration::from_millis(10));
     }
     let pending: i64 = reader.query_row("SELECT count(*) FROM attempts a JOIN versions v ON v.id=a.version_id WHERE v.notice_id='slow' AND a.state='in_flight' AND a.response IS NULL", [], |row| row.get(0)).unwrap();
@@ -1208,7 +1304,10 @@ fn completed_response_is_durable_while_another_model_call_is_pending() {
     release_tx.send(()).unwrap();
     server_thread.join().unwrap();
     let summary = pipeline_thread.join().unwrap();
-    assert!(durable, "fast response, extraction and cost must be saved before slow response finishes");
+    assert!(
+        durable,
+        "fast response, extraction and cost must be saved before slow response finishes"
+    );
     assert_eq!(pending, 1);
     assert_eq!((summary.calls, summary.extracted), (2, 2));
 }
@@ -1219,8 +1318,18 @@ fn country_only_extraction_persists_applicant_type_review() {
     let temp = TempDir::new().unwrap();
     let mut store = db(&temp);
     *mock.response_mode.lock().unwrap() = "country_only".into();
-    let summary = pipeline::run(&mut store, &http(), &mock.model(), vec![mock.notice("country", &[])], &options(&temp, 1)).unwrap();
-    assert_eq!((summary.calls, summary.needs_review, summary.extracted), (1, 1, 0));
+    let summary = pipeline::run(
+        &mut store,
+        &http(),
+        &mock.model(),
+        vec![mock.notice("country", &[])],
+        &options(&temp, 1),
+    )
+    .unwrap();
+    assert_eq!(
+        (summary.calls, summary.needs_review, summary.extracted),
+        (1, 1, 0)
+    );
     let (attempt_state, version_state, extraction): (String, String, String) = store.conn.query_row(
         "SELECT a.state,v.state,v.extraction FROM attempts a JOIN versions v ON v.id=a.version_id", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))
     ).unwrap();
@@ -1236,9 +1345,22 @@ fn unreadable_zip_with_source_text_remains_under_review() {
     let mut store = db(&temp);
     let bytes = b"PK\x03\x04not a valid archive";
     mock.put("/broken.zip", bytes);
-    let summary = pipeline::run(&mut store, &http(), &mock.model(), vec![mock.notice("broken", &["/broken.zip"])], &options(&temp, 1)).unwrap();
+    let summary = pipeline::run(
+        &mut store,
+        &http(),
+        &mock.model(),
+        vec![mock.notice("broken", &["/broken.zip"])],
+        &options(&temp, 1),
+    )
+    .unwrap();
     assert_eq!((summary.calls, summary.needs_review), (1, 1));
     let documents = store.previous("broken").unwrap().unwrap();
     assert_eq!(documents[0].sha256, pipeline::sha256(bytes));
-    assert!(documents[0].coverage_warning.as_ref().unwrap().contains("Archive could not be read"));
+    assert!(
+        documents[0]
+            .coverage_warning
+            .as_ref()
+            .unwrap()
+            .contains("Archive could not be read")
+    );
 }

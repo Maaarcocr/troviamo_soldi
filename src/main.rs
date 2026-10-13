@@ -110,8 +110,7 @@ fn model_client(allow_paid: bool, mock_url: Option<&str>) -> Result<ModelClient>
     let (endpoint, api_key) = if let Some(url) = mock_url {
         let parsed = url::Url::parse(url)?;
         ensure!(
-            ["localhost", "127.0.0.1", "[::1]", "::1"]
-                .contains(&parsed.host_str().unwrap_or(""))
+            ["localhost", "127.0.0.1", "[::1]", "::1"].contains(&parsed.host_str().unwrap_or(""))
                 && ["http", "https"].contains(&parsed.scheme())
                 && parsed.username().is_empty()
                 && parsed.password().is_none(),
@@ -338,15 +337,9 @@ mod run_cli_tests {
 
     #[test]
     fn run_rejects_removed_flag_and_does_not_advertise_it() {
-        let error = Cli::try_parse_from([
-            "funding-rust",
-            "run",
-            "--limit",
-            "1",
-            "--dry-run",
-        ])
-        .err()
-        .unwrap();
+        let error = Cli::try_parse_from(["funding-rust", "run", "--limit", "1", "--dry-run"])
+            .err()
+            .unwrap();
         assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
         let help = Cli::try_parse_from(["funding-rust", "run", "--help"])
             .err()
@@ -368,9 +361,7 @@ mod run_cli_tests {
         else {
             panic!("expected run command");
         };
-        let error = model_client(allow_paid, mock_url.as_deref())
-            .err()
-            .unwrap();
+        let error = model_client(allow_paid, mock_url.as_deref()).err().unwrap();
         assert!(error.to_string().contains("No model call authorized"));
     }
 
@@ -407,14 +398,8 @@ mod run_cli_tests {
 
     #[test]
     fn daily_alias_keeps_paid_opt_in() {
-        let cli = Cli::try_parse_from([
-            "funding-rust",
-            "daily",
-            "--limit",
-            "1",
-            "--allow-paid",
-        ])
-        .unwrap();
+        let cli =
+            Cli::try_parse_from(["funding-rust", "daily", "--limit", "1", "--allow-paid"]).unwrap();
         assert!(matches!(
             cli.command,
             Command::Run {

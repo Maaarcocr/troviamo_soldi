@@ -5,10 +5,10 @@ use crate::{
     types::{DocumentVersion, Notice, RunSummary, Usage},
 };
 use anyhow::{Context, Result, bail, ensure};
+use rayon::prelude::*;
 use reqwest::blocking::Client;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use rayon::prelude::*;
 use std::{collections::HashSet, io::Read, path::PathBuf};
 use url::Url;
 
@@ -73,69 +73,72 @@ pub fn run(
             break;
         }
         let downloaded: Vec<_> = io_pool.install(|| {
-            batch.par_iter().map(|notice| (*notice, prepare(client, notice, options))).collect()
+            batch
+                .par_iter()
+                .map(|notice| (*notice, prepare(client, notice, options)))
+                .collect()
         });
         for (notice, prepared) in downloaded {
-        ensure!(!notice.id.is_empty(), "Invalid notice ID");
-        let previous = store.previous(&notice.id)?;
-        let documents = match prepared {
-            Ok(docs) => docs,
-            Err(error) => {
-                let fingerprint = sha256(
-                    format!("download-failure:{}", serde_json::to_string(&notice)?).as_bytes(),
-                );
-                if !options.retry_failed
-                    && let Some((version, _)) = store.cached(&notice.id, &fingerprint)?
-                {
-                    store.select_cached_version(notice, version)?;
+            ensure!(!notice.id.is_empty(), "Invalid notice ID");
+            let previous = store.previous(&notice.id)?;
+            let documents = match prepared {
+                Ok(docs) => docs,
+                Err(error) => {
+                    let fingerprint = sha256(
+                        format!("download-failure:{}", serde_json::to_string(&notice)?).as_bytes(),
+                    );
+                    if !options.retry_failed
+                        && let Some((version, _)) = store.cached(&notice.id, &fingerprint)?
+                    {
+                        store.select_cached_version(notice, version)?;
+                        summary.unchanged += 1;
+                        continue;
+                    }
+                    summary.processed += 1;
+                    summary.failed += 1;
+                    let version = store.begin_version(notice, &fingerprint, &[])?;
+                    store.finish_version(version, "failed", None, Some(&format!("{error:#}")))?;
+                    eprintln!(
+                        "{}: needs review (download/input error: {error:#})",
+                        notice.id
+                    );
+                    continue;
+                }
+            };
+            let fingerprint = fingerprint(notice, &documents)?;
+            let cached = store.cached(&notice.id, &fingerprint)?;
+            if let Some((version, state)) = &cached {
+                let retryable =
+                    ["failed", "in_flight", "pending", "needs_review"].contains(&state.as_str());
+                if !options.retry_failed || !retryable {
+                    store.select_cached_version(notice, *version)?;
                     summary.unchanged += 1;
                     continue;
                 }
-                summary.processed += 1;
-                summary.failed += 1;
-                let version = store.begin_version(notice, &fingerprint, &[])?;
-                store.finish_version(version, "failed", None, Some(&format!("{error:#}")))?;
-                eprintln!(
-                    "{}: needs review (download/input error: {error:#})",
-                    notice.id
-                );
-                continue;
             }
-        };
-        let fingerprint = fingerprint(notice, &documents)?;
-        let cached = store.cached(&notice.id, &fingerprint)?;
-        if let Some((version, state)) = &cached {
-            let retryable =
-                ["failed", "in_flight", "pending", "needs_review"].contains(&state.as_str());
-            if !options.retry_failed || !retryable {
-                store.select_cached_version(notice, *version)?;
-                summary.unchanged += 1;
-                continue;
-            }
+            // An attempted notice consumes exactly one slot, even on failure or review.
+            summary.processed += 1;
+            let version = store.begin_version(notice, &fingerprint, &documents)?;
+            let body = match model::request_body(notice, &documents, &options.cache_dir) {
+                Ok(body) => body,
+                Err(error) => {
+                    summary.failed += 1;
+                    store.finish_version(version, "failed", None, Some(&error.to_string()))?;
+                    continue;
+                }
+            };
+            let attempt =
+                store.attempt(version, &sha256(serde_json::to_string(&body)?.as_bytes()))?;
+            summary.calls += 1;
+            work_items.push(WorkItem {
+                version,
+                attempt,
+                body,
+                notice: notice.clone(),
+                documents: documents.clone(),
+                previous: previous.clone(),
+            });
         }
-        // An attempted notice consumes exactly one slot, even on failure or review.
-        summary.processed += 1;
-        let version = store.begin_version(notice, &fingerprint, &documents)?;
-        let body = match model::request_body(notice, &documents, &options.cache_dir) {
-            Ok(body) => body,
-            Err(error) => {
-                summary.failed += 1;
-                store.finish_version(version, "failed", None, Some(&error.to_string()))?;
-                continue;
-            }
-        };
-        let attempt = store.attempt(version, &sha256(serde_json::to_string(&body)?.as_bytes()))?;
-        summary.calls += 1;
-        work_items.push(WorkItem {
-            version,
-            attempt,
-            body,
-            notice: notice.clone(),
-            documents: documents.clone(),
-            previous: previous.clone(),
-        });
-    }
-
     }
 
     // Workers only make requests. The caller consumes completed responses and
@@ -144,14 +147,23 @@ pub fn run(
         let (sender, receiver) = std::sync::mpsc::channel();
         scope.spawn(|| {
             io_pool.install(|| {
-                work_items.into_par_iter().for_each_with(sender, |sender, item| {
-                    let response = model.send(&item.body);
-                    let _ = sender.send((item, response));
-                });
+                work_items
+                    .into_par_iter()
+                    .for_each_with(sender, |sender, item| {
+                        let response = model.send(&item.body);
+                        let _ = sender.send((item, response));
+                    });
             });
         });
         for (work_item, response) in receiver {
-        let WorkItem { version, attempt, notice, documents, previous, .. } = work_item;
+            let WorkItem {
+                version,
+                attempt,
+                notice,
+                documents,
+                previous,
+                ..
+            } = work_item;
             match response {
                 Err(error) => {
                     let usage = Usage::default();
@@ -176,9 +188,7 @@ pub fn run(
                                 .as_ref()
                                 .map(|old| {
                                     old.iter()
-                                        .filter(|d| {
-                                            !document_still_present(d, &documents)
-                                        })
+                                        .filter(|d| !document_still_present(d, &documents))
                                         .map(|d| d.filename.clone())
                                         .collect::<Vec<_>>()
                                 })
@@ -188,7 +198,10 @@ pub fn run(
                             }
                             let unsupported: Vec<_> = documents
                                 .iter()
-                                .filter(|d| !model::supported_mime(&d.mime_type) && d.mime_type != "application/zip")
+                                .filter(|d| {
+                                    !model::supported_mime(&d.mime_type)
+                                        && d.mime_type != "application/zip"
+                                })
                                 .map(|d| d.filename.clone())
                                 .collect();
                             if !unsupported.is_empty() {
@@ -197,7 +210,10 @@ pub fn run(
 
                             for document in &documents {
                                 if let Some(warning) = &document.coverage_warning {
-                                    extraction["review_reasons"].as_array_mut().unwrap().push(json!(warning));
+                                    extraction["review_reasons"]
+                                        .as_array_mut()
+                                        .unwrap()
+                                        .push(json!(warning));
                                 }
                             }
 
@@ -243,7 +259,7 @@ pub fn run(
                     }
                 }
             }
-    }
+        }
         Ok(())
     })?;
     summary.finish();
@@ -261,7 +277,10 @@ fn document_still_present(previous: &DocumentVersion, current: &[DocumentVersion
         // Historical expanded members lacked a member identity. Do not let the
         // newly retained archive root mask a removed child on the first upgrade.
         // Exact filenames retain known flat members; ambiguous old paths review.
-        if current.iter().any(|root| root.url == previous.url && root.mime_type == "application/zip") {
+        if current
+            .iter()
+            .any(|root| root.url == previous.url && root.mime_type == "application/zip")
+        {
             document.filename == previous.filename
         } else {
             document.archive_member.is_none()
@@ -312,16 +331,24 @@ fn prepare(client: &Client, notice: &Notice, options: &RunOptions) -> Result<Vec
             let expanded = unzip_originals(&bytes);
             let (files, warnings) = match expanded {
                 Ok(contents) => (contents.files, contents.warnings),
-                Err(error) => (Vec::new(), vec![format!("Archive could not be read: {error:#}")]),
+                Err(error) => (
+                    Vec::new(),
+                    vec![format!("Archive could not be read: {error:#}")],
+                ),
             };
             let mut original = cache_document(
-                &document.url, document.filename.clone(), &bytes, None, options,
+                &document.url,
+                document.filename.clone(),
+                &bytes,
+                None,
+                options,
             )?;
             original.mime_type = "application/zip".into();
             if !warnings.is_empty() {
                 original.coverage_warning = Some(format!(
                     "Archive {} was not completely read: {}. Requirements may be incomplete.",
-                    document.filename, warnings.join("; ")
+                    document.filename,
+                    warnings.join("; ")
                 ));
             }
             documents.push(original);
@@ -336,7 +363,11 @@ fn prepare(client: &Client, notice: &Notice, options: &RunOptions) -> Result<Vec
             }
         } else {
             documents.push(cache_document(
-                &document.url, document.filename.clone(), &bytes, None, options,
+                &document.url,
+                document.filename.clone(),
+                &bytes,
+                None,
+                options,
             )?);
         }
     }
@@ -379,7 +410,11 @@ fn cache_document(
     }
     Ok(DocumentVersion {
         url: url.into(),
-        filename: if filename.trim().is_empty() { "document".into() } else { filename },
+        filename: if filename.trim().is_empty() {
+            "document".into()
+        } else {
+            filename
+        },
         mime_type: mime.into(),
         sha256: hash,
         bytes: data.len() as u64,
@@ -400,13 +435,18 @@ fn unzip_originals(bytes: &[u8]) -> Result<ArchiveContents> {
     const MAX_TOTAL_BYTES: u64 = 50 * 1024 * 1024;
     let mut archive =
         zip::ZipArchive::new(std::io::Cursor::new(bytes)).context("Unreadable zip archive")?;
-    let mut contents = ArchiveContents { files: Vec::new(), warnings: Vec::new() };
+    let mut contents = ArchiveContents {
+        files: Vec::new(),
+        warnings: Vec::new(),
+    };
     let mut total = 0u64;
     for i in 0..archive.len() {
         let entry = match archive.by_index(i) {
             Ok(entry) => entry,
             Err(error) => {
-                contents.warnings.push(format!("Entry {i} unreadable: {error}"));
+                contents
+                    .warnings
+                    .push(format!("Entry {i} unreadable: {error}"));
                 continue;
             }
         };
@@ -416,23 +456,31 @@ fn unzip_originals(bytes: &[u8]) -> Result<ArchiveContents> {
         let name = match entry.name() {
             Ok(name) => name.into_owned(),
             Err(error) => {
-                contents.warnings.push(format!("Entry {i} has an unreadable name: {error}"));
+                contents
+                    .warnings
+                    .push(format!("Entry {i} has an unreadable name: {error}"));
                 continue;
             }
         };
         let remaining = MAX_TOTAL_BYTES.saturating_sub(total);
         let allowed = MAX_ENTRY_BYTES.min(remaining);
         if entry.size() > allowed {
-            contents.warnings.push(format!("{name}: exceeds archive decompression limit"));
+            contents
+                .warnings
+                .push(format!("{name}: exceeds archive decompression limit"));
             continue;
         }
         let mut buf = Vec::new();
         if let Err(error) = entry.take(allowed + 1).read_to_end(&mut buf) {
-            contents.warnings.push(format!("{name}: could not decompress ({error})"));
+            contents
+                .warnings
+                .push(format!("{name}: could not decompress ({error})"));
             continue;
         }
         if buf.len() as u64 > allowed {
-            contents.warnings.push(format!("{name}: exceeds archive decompression limit"));
+            contents
+                .warnings
+                .push(format!("{name}: exceeds archive decompression limit"));
             continue;
         }
         total += buf.len() as u64;
@@ -565,7 +613,8 @@ mod tests {
     fn historical_archive_children_do_not_match_the_new_archive_root() {
         let legacy = |filename: &str| -> DocumentVersion {
             serde_json::from_value(json!({"url":"https://example.org/archive.zip",
-                "filename":filename,"mime_type":"application/pdf","sha256":"hash","bytes":10})).unwrap()
+                "filename":filename,"mime_type":"application/pdf","sha256":"hash","bytes":10}))
+            .unwrap()
         };
         let old_a = legacy("archive.zip/a.pdf");
         let old_b = legacy("archive.zip/b.pdf");

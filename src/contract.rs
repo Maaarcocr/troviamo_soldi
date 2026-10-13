@@ -15,7 +15,8 @@ const TOP_KEYS: &[&str] = &[
     "citations",
 ];
 const COMMON: &[&str] = &["id", "label", "op", "citation_ids"];
-pub(crate) const MISSING_APPLICANT_TYPE: &str = "No applicant-type requirement was extracted; cannot determine eligibility for municipalities";
+pub(crate) const MISSING_APPLICANT_TYPE: &str =
+    "No applicant-type requirement was extracted; cannot determine eligibility for municipalities";
 
 /// Geography, population and financial conditions do not establish who may apply.
 /// Unmappable applicant classes remain manual and cannot satisfy this coverage guard.
@@ -78,7 +79,9 @@ pub fn to_stored(value: &Value) -> Result<Value> {
     let mut stored = value.clone();
     stored["schema_version"] = json!(2);
     let mut reasons = if rules.is_empty() {
-        vec![json!("No requirements were extracted from the supplied sources")]
+        vec![json!(
+            "No requirements were extracted from the supplied sources"
+        )]
     } else {
         vec![]
     };
@@ -371,9 +374,8 @@ mod tests {
         let mut stored = to_stored(&live).unwrap();
         let municipality =
             json!({"istatCode":"081001", "region":"Sicilia", "registryReferenceDate":"2026-10-06"});
-        let evaluate = |call: &Value| {
-            engine::evaluate(call, &municipality, &[], None, "2026-10-06T12:00:00Z")
-        };
+        let evaluate =
+            |call: &Value| engine::evaluate(call, &municipality, &[], None, "2026-10-06T12:00:00Z");
         assert_eq!(evaluate(&stored), evaluate(&live));
         assert_eq!(evaluate(&stored)["state"], "excluded");
 

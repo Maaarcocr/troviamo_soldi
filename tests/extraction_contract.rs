@@ -520,8 +520,10 @@ fn applicant_type_sets_and_broad_public_body_requirements_cover_type() {
         ("entity.kind", json!(["startup", "individual"]), "excluded"),
         ("entity.publicBody", json!([false]), "excluded"),
     ] {
-        let call = facts(extraction(vec![json!({"id":"applicant", "label":"Applicant type",
-            "op":"one_of", "field":field, "values":values, "citation_ids":["c1"]})]));
+        let call = facts(extraction(vec![
+            json!({"id":"applicant", "label":"Applicant type",
+            "op":"one_of", "field":field, "values":values, "citation_ids":["c1"]}),
+        ]));
         engine::validate_extraction(&call, &sources()).unwrap();
         assert_eq!(evaluate(&call)["state"], expected);
         assert!(engine::extraction_review_reasons(&call).is_empty());
