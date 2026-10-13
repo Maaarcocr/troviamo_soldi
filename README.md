@@ -41,8 +41,6 @@ Configure `OPENROUTER_API_KEY` externally on the server. The default uses OpenRo
 # Use another model without code changes.
 ./target/release/funding-rust research --allow-paid --model YOUR_OPENROUTER_MODEL
 
-# Operator-chosen checkpoint budget; this is a call count, not a dollar cap.
-./target/release/funding-rust research --allow-paid --max-model-turns 20
 
 # Inspect actual checkpoint, tool trace and reported cost without requests.
 ./target/release/funding-rust research-status --job JOB_ID --out research-trace.json
@@ -53,7 +51,7 @@ Configure `OPENROUTER_API_KEY` externally on the server. The default uses OpenRo
 
 The default model preserves the existing configuration choice, `openai/gpt-6-luna`; `FUNDING_RESEARCH_MODEL` or `--model` overrides it. Availability, capability and pricing must be checked with your provider before a live pilot. The application does not claim that this default has passed a research-quality evaluation.
 
-There is no hidden tiny output-token cap or model-request timeout. Optional `--max-model-turns` is a transparent operator limit. Reaching it means **research incomplete**, not ineligible. Provider-side spending limits are still necessary: a model call count is not a monetary budget. OpenRouter server-side search also consumes provider credits; an optional external search/rendering service has separate charges. Reported costs are retained; missing cost is unknown, not zero.
+There is no hidden tiny output-token cap or model-request timeout. Provider-side spending limits are still necessary. OpenRouter server-side search also consumes provider credits; an optional external search/rendering service has separate charges. Reported costs are retained; missing cost is unknown, not zero.
 
 The job stores the conversation/driver checkpoint and tool results. An interrupted or failed provider request may already have been billed. Do not blindly launch a second job to retry it. Review the saved job state before resuming. Persistence does not provide a distributed exactly-once billing guarantee.
 

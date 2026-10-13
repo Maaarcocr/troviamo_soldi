@@ -77,9 +77,6 @@ enum Command {
         /// Explicitly permit billable provider/search requests with externally configured keys.
         #[arg(long)]
         allow_paid: bool,
-        /// Optional operator-selected checkpoint budget, not an eligibility limit.
-        #[arg(long)]
-        max_model_turns: Option<usize>,
     },
     /// Read a saved research checkpoint and trace without making requests or changing it.
     ResearchStatus {
@@ -300,15 +297,10 @@ fn main() -> Result<()> {
             job,
             model,
             allow_paid,
-            max_model_turns,
         } => {
             ensure!(
                 allow_paid,
                 "Research needs explicit --allow-paid and externally configured provider/search credentials. No model call made."
-            );
-            ensure!(
-                max_model_turns != Some(0),
-                "--max-model-turns must be positive"
             );
             let municipality_context = store
                 .municipalities()?
@@ -339,7 +331,6 @@ fn main() -> Result<()> {
                     objective,
                     model,
                     allow_paid,
-                    max_model_turns,
                 },
             )?;
             println!("{}", serde_json::to_string_pretty(&result)?);

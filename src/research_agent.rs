@@ -32,8 +32,6 @@ pub struct ResearchAgentOptions {
     pub objective: String,
     pub model: String,
     pub allow_paid: bool,
-    /// Optional operator budget for this invocation, not a research conclusion.
-    pub max_model_turns: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -75,8 +73,7 @@ impl Checkpoint {
             municipality_id: options.municipality_id.clone(),
             objective: options.objective.clone(),
             model: options.model.clone(),
-            // There is no hidden model-call or output-token budget. The operator
-            // may pause after a chosen number of calls using max_model_turns.
+            // There is no hidden model-call or output-token budget.
             run: AgentRun::new(prompt).max_turns(usize::MAX),
             step: None,
             tool_results: Vec::new(),
@@ -169,10 +166,6 @@ pub fn run(options: &ResearchAgentOptions) -> Result<Value> {
         !options.objective.trim().is_empty(),
         "Specify a research objective"
     );
-    ensure!(
-        options.max_model_turns != Some(0),
-        "--max-model-turns must be positive"
-    );
 
     let mut session = ResearchSession::open(&options.db_path, &options.workspace, &options.run_id)?;
     let mut state: Checkpoint = match session.load_checkpoint()? {
@@ -244,7 +237,6 @@ pub fn run(options: &ResearchAgentOptions) -> Result<Value> {
         .iter()
         .map(|tool| tool.name.to_string())
         .collect();
-    let mut calls_this_invocation = 0usize;
     state.save(&session, "running")?;
     eprintln!("Research job: {}", state.run_id);
 
@@ -301,13 +293,6 @@ pub fn run(options: &ResearchAgentOptions) -> Result<Value> {
                 history,
                 turn,
             } => {
-                if options
-                    .max_model_turns
-                    .is_some_and(|limit| calls_this_invocation >= limit)
-                {
-                    state.save(&session, "budget_exhausted")?;
-                    return Ok(state.summary("budget_exhausted", None));
-                }
                 let mut request = CompletionRequest::new(prompt)
                     .messages(history)
                     .preamble(research::INSTRUCTIONS)
@@ -363,7 +348,6 @@ pub fn run(options: &ResearchAgentOptions) -> Result<Value> {
                 // file again when it needs to inspect it on a later turn.
                 state.native_file_ids.clear();
                 state.in_flight = None;
-                calls_this_invocation += 1;
                 state.save(&session, "running")?;
             }
             AgentRunStep::CallTools { calls } => {
