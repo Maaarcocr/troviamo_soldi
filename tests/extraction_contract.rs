@@ -291,7 +291,8 @@ fn region_names_are_canonical_and_aliases_never_cause_false_exclusion() {
         assert_eq!(evaluate(&call)["needs_review"], true);
     }
     let call = extraction(vec![condition("region", "entity.region", json!("Sicilia"))]);
-    assert_eq!(evaluate(&call)["state"], "screening_match");
+    assert_eq!(evaluate(&call)["results"][0]["state"], "pass");
+    assert_eq!(evaluate(&call)["state"], "review_required");
 }
 #[test]
 fn identifiers_allow_unicode_and_spaces_without_changing_reference_identity() {
@@ -315,8 +316,8 @@ fn identifiers_allow_unicode_and_spaces_without_changing_reference_identity() {
     );
     let mut call = facts(extraction(vec![condition(
         "requisito città 1",
-        "entity.country",
-        json!("IT"),
+        "entity.kind",
+        json!("municipality"),
     )]));
     call["citations"][0]["id"] = json!("fonte città 1");
     call["requirements"][0]["citation_ids"] = json!(["fonte città 1"]);
@@ -409,6 +410,123 @@ fn unknown_applicant_and_empty_requirements_do_not_become_a_match() {
         assert_eq!(result["state"], "review_required");
         assert_eq!(result["visible"], true);
         assert_eq!(result["legal_clearance"], false);
+    }
+}
+
+#[test]
+fn passing_geography_population_and_finances_do_not_establish_applicant_type() {
+    let evidence = vec![
+        json!({"id":"population", "municipalityId":"081001", "projectId":null,
+            "callId":null, "field":"population", "value":2000, "provenance":"official",
+            "observedAt":"2026-01-01", "validUntil":null, "populationBasis":"legal",
+            "source":{"title":"Official population"}}),
+        json!({"id":"budget", "municipalityId":"081001", "projectId":null,
+            "callId":null, "field":"financial.approvedBudget", "value":true,
+            "provenance":"official", "observedAt":"2026-10-06", "validUntil":null,
+            "source":{"title":"Current approved budget"}}),
+    ];
+    for requirement in [
+        condition("country", "entity.country", json!("IT")),
+        condition("region", "entity.region", json!("Sicilia")),
+        json!({"id":"population", "label":"Population", "op":"range",
+            "field":"population", "min":null, "max":5000, "population_basis":"legal",
+            "reference_date":"2026-01-01", "citation_ids":["c1"]}),
+        condition("budget", "financial.approvedBudget", json!(true)),
+    ] {
+        let historical = extraction(vec![requirement]);
+        for call in [historical.clone(), facts(historical)] {
+            engine::validate_extraction(&call, &sources()).unwrap();
+            let unchanged = call.clone();
+            let result = engine::evaluate(
+                &call,
+                &municipality(),
+                &evidence,
+                None,
+                "2026-10-06T12:00:00Z",
+            );
+            assert_eq!(result["results"][0]["state"], "pass");
+            assert_eq!(result["state"], "review_required");
+            assert_eq!(result["visible"], true);
+            assert_eq!(result["needs_review"], true);
+            assert!(
+                engine::extraction_review_reasons(&call)
+                    .iter()
+                    .any(|reason| reason.contains("No applicant-type requirement"))
+            );
+            assert_eq!(call, unchanged);
+        }
+    }
+}
+
+#[test]
+fn unmappable_applicant_type_stays_review_even_with_matching_country() {
+    let call = facts(extraction(vec![
+        condition("country", "entity.country", json!("IT")),
+        json!({"id":"applicant", "label":"Applicant category", "op":"manual",
+            "note":"The source category cannot be mapped faithfully.", "citation_ids":["c1"]}),
+    ]));
+    engine::validate_extraction(&call, &sources()).unwrap();
+    let result = evaluate(&call);
+    assert_eq!(result["results"][0]["state"], "pass");
+    assert_eq!(result["state"], "review_required");
+    assert!(
+        engine::extraction_review_reasons(&call)
+            .iter()
+            .any(|reason| reason.contains("No applicant-type requirement"))
+    );
+}
+
+#[test]
+fn missing_applicant_type_does_not_override_a_definite_country_exclusion() {
+    let mut historical = extraction(vec![
+        condition("country", "entity.country", json!("EE")),
+        condition("project", "project.publicOwnership", json!(true)),
+        json!({"id":"applicant", "label":"Applicant category", "op":"manual",
+            "note":"The source category cannot be mapped faithfully.", "citation_ids":["c1"]}),
+    ]);
+    historical["status"] = json!("unknown");
+    historical["closes_at"] = Value::Null;
+    for call in [historical.clone(), facts(historical.clone())] {
+        engine::validate_extraction(&call, &sources()).unwrap();
+        let result = evaluate(&call);
+        assert_eq!(result["state"], "excluded");
+        assert_eq!(result["visible"], false);
+        assert_eq!(result["results"][0]["state"], "fail");
+        assert!(
+            result["review_reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|reason| reason
+                    .as_str()
+                    .unwrap()
+                    .contains("No applicant-type requirement"))
+        );
+    }
+    historical["review_reasons"] =
+        json!(["The unreadable annex may change the applicant country condition"]);
+    assert_eq!(evaluate(&historical)["state"], "review_required");
+}
+
+#[test]
+fn applicant_type_sets_and_broad_public_body_requirements_cover_type() {
+    for (field, values, expected) in [
+        (
+            "entity.kind",
+            json!(["municipality", "startup"]),
+            "screening_match",
+        ),
+        ("entity.publicBody", json!([true]), "screening_match"),
+        ("entity.kind", json!(["startup", "individual"]), "excluded"),
+        ("entity.publicBody", json!([false]), "excluded"),
+    ] {
+        let call = facts(extraction(vec![
+            json!({"id":"applicant", "label":"Applicant type",
+            "op":"one_of", "field":field, "values":values, "citation_ids":["c1"]}),
+        ]));
+        engine::validate_extraction(&call, &sources()).unwrap();
+        assert_eq!(evaluate(&call)["state"], expected);
+        assert!(engine::extraction_review_reasons(&call).is_empty());
     }
 }
 
@@ -520,10 +638,13 @@ fn broad_country_lists_and_repeated_set_members_preserve_their_meaning() {
         .clone();
     assert!(values.len() > 100);
     values.push(json!("IT"));
-    let mut call = facts(extraction(vec![json!({
-        "id":"countries", "label":"Paesi", "op":"one_of", "field":"entity.country",
-        "values":values, "citation_ids":["c1", "c1"]
-    })]));
+    let mut call = facts(extraction(vec![
+        json!({
+            "id":"countries", "label":"Paesi", "op":"one_of", "field":"entity.country",
+            "values":values, "citation_ids":["c1", "c1"]
+        }),
+        condition("applicant", "entity.kind", json!("municipality")),
+    ]));
     engine::validate_extraction(&call, &sources()).unwrap();
     assert_eq!(evaluate(&call)["state"], "screening_match");
     let schema = engine::extraction_schema();

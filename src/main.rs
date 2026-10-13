@@ -47,9 +47,6 @@ enum Command {
         input: Option<PathBuf>,
         #[arg(long, default_value = "var/files")]
         cache: PathBuf,
-        /// Fetch/hash and report candidates without any model request.
-        #[arg(long)]
-        dry_run: bool,
         /// Explicit operator opt-in for billable OpenRouter requests; needs OPENROUTER_API_KEY.
         #[arg(long)]
         allow_paid: bool,
@@ -100,6 +97,37 @@ fn client(timeout: Option<Duration>) -> Result<Client> {
         .timeout(timeout)
         .user_agent("FundingRust/0.1 (official funding source research)")
         .build()?)
+}
+fn model_client(allow_paid: bool, mock_url: Option<&str>) -> Result<ModelClient> {
+    ensure!(
+        !(allow_paid && mock_url.is_some()),
+        "--allow-paid and --mock-url are mutually exclusive"
+    );
+    ensure!(
+        allow_paid || mock_url.is_some(),
+        "No model call authorized: use test --mock-url or explicitly --allow-paid after setting a budget/key"
+    );
+    let (endpoint, api_key) = if let Some(url) = mock_url {
+        let parsed = url::Url::parse(url)?;
+        ensure!(
+            ["localhost", "127.0.0.1", "[::1]", "::1"].contains(&parsed.host_str().unwrap_or(""))
+                && ["http", "https"].contains(&parsed.scheme())
+                && parsed.username().is_empty()
+                && parsed.password().is_none(),
+            "Mock endpoint must be loopback HTTP(S) without credentials"
+        );
+        (url.to_owned(), None)
+    } else {
+        let key = std::env::var("OPENROUTER_API_KEY")
+            .context("Set OPENROUTER_API_KEY on the server; never in browser or source files")?;
+        ensure!(!key.trim().is_empty(), "Empty API key");
+        (ENDPOINT.into(), Some(key))
+    };
+    Ok(ModelClient {
+        http: client(None)?,
+        endpoint,
+        api_key,
+    })
 }
 fn config(path: &Path) -> Result<Value> {
     serde_json::from_slice(
@@ -252,48 +280,13 @@ fn main() -> Result<()> {
             sources: source_path,
             input,
             cache,
-            dry_run,
             allow_paid,
             mock_url,
             retry_failed,
         } => {
             ensure!(limit > 0, "--limit must be greater than zero");
-            ensure!(
-                !(allow_paid && mock_url.is_some()),
-                "--allow-paid and --mock-url are mutually exclusive"
-            );
-            ensure!(
-                dry_run || allow_paid || mock_url.is_some(),
-                "No model call authorized: use --dry-run, test --mock-url, or explicitly --allow-paid after setting a budget/key"
-            );
             let allow_localhost = mock_url.is_some();
-            let model = if dry_run {
-                None
-            } else {
-                let (endpoint, api_key) = if let Some(url) = mock_url {
-                    let parsed = url::Url::parse(&url)?;
-                    ensure!(
-                        ["localhost", "127.0.0.1", "[::1]", "::1"]
-                            .contains(&parsed.host_str().unwrap_or(""))
-                            && ["http", "https"].contains(&parsed.scheme())
-                            && parsed.username().is_empty()
-                            && parsed.password().is_none(),
-                        "Mock endpoint must be loopback HTTP(S) without credentials"
-                    );
-                    (url, None)
-                } else {
-                    let key = std::env::var("OPENROUTER_API_KEY").context(
-                        "Set OPENROUTER_API_KEY on the server; never in browser or source files",
-                    )?;
-                    ensure!(!key.trim().is_empty(), "Empty API key");
-                    (ENDPOINT.into(), Some(key))
-                };
-                Some(ModelClient {
-                    http: client(None)?,
-                    endpoint,
-                    api_key,
-                })
-            };
+            let model = model_client(allow_paid, mock_url.as_deref())?;
             if retry_failed {
                 eprintln!(
                     "Explicit retry enabled: an earlier uncertain request may already have been billed. One call per notice this run."
@@ -319,7 +312,7 @@ fn main() -> Result<()> {
             let summary = pipeline::run(
                 &mut store,
                 &http,
-                model.as_ref(),
+                &model,
                 notices,
                 &RunOptions {
                     limit,
@@ -327,7 +320,6 @@ fn main() -> Result<()> {
                     allowed_hosts,
                     allow_localhost,
                     retry_failed,
-                    dry_run,
                 },
             )?;
             println!("{}", serde_json::to_string_pretty(&summary)?);
@@ -337,6 +329,86 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod run_cli_tests {
+    use super::*;
+
+    #[test]
+    fn run_rejects_removed_flag_and_does_not_advertise_it() {
+        let error = Cli::try_parse_from(["funding-rust", "run", "--limit", "1", "--dry-run"])
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        let help = Cli::try_parse_from(["funding-rust", "run", "--help"])
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(!help.contains("--dry-run"));
+        assert!(help.contains("--allow-paid"));
+        assert!(help.contains("--mock-url"));
+    }
+
+    #[test]
+    fn run_still_requires_explicit_model_authorization() {
+        let cli = Cli::try_parse_from(["funding-rust", "run", "--limit", "1"]).unwrap();
+        let Command::Run {
+            allow_paid,
+            mock_url,
+            ..
+        } = cli.command
+        else {
+            panic!("expected run command");
+        };
+        let error = model_client(allow_paid, mock_url.as_deref()).err().unwrap();
+        assert!(error.to_string().contains("No model call authorized"));
+    }
+
+    #[test]
+    fn mock_and_paid_authorization_remain_mutually_exclusive() {
+        let error = model_client(true, Some("http://127.0.0.1:1234/model"))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn mock_client_is_loopback_only_and_never_uses_an_api_key() {
+        for endpoint in [
+            "http://127.0.0.1:1234/model",
+            "http://localhost:1234/model",
+            "http://[::1]:1234/model",
+        ] {
+            let model = model_client(false, Some(endpoint)).unwrap();
+            assert_eq!(model.endpoint, endpoint);
+            assert!(model.api_key.is_none());
+        }
+        for endpoint in [
+            ENDPOINT,
+            "http://example.com/model",
+            "http://localhost.example.com/model",
+            "http://user:password@localhost/model",
+            "ftp://127.0.0.1/model",
+        ] {
+            let error = model_client(false, Some(endpoint)).err().unwrap();
+            assert!(error.to_string().contains("Mock endpoint must be loopback"));
+        }
+    }
+
+    #[test]
+    fn daily_alias_keeps_paid_opt_in() {
+        let cli =
+            Cli::try_parse_from(["funding-rust", "daily", "--limit", "1", "--allow-paid"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Run {
+                allow_paid: true,
+                mock_url: None,
+                ..
+            }
+        ));
+    }
 }
 
 #[cfg(test)]

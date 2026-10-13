@@ -15,6 +15,30 @@ const TOP_KEYS: &[&str] = &[
     "citations",
 ];
 const COMMON: &[&str] = &["id", "label", "op", "citation_ids"];
+pub(crate) const MISSING_APPLICANT_TYPE: &str =
+    "No applicant-type requirement was extracted; cannot determine eligibility for municipalities";
+
+/// Geography, population and financial conditions do not establish who may apply.
+/// Unmappable applicant classes remain manual and cannot satisfy this coverage guard.
+pub(crate) fn has_applicant_type_requirement(rules: &[Value]) -> bool {
+    rules.iter().any(|rule| {
+        matches!(rule["op"].as_str(), Some("equals" | "one_of"))
+            && matches!(
+                rule["field"].as_str(),
+                Some("entity.kind" | "entity.publicBody")
+            )
+    })
+}
+
+fn add_applicant_type_review(rules: &[Value], reasons: &mut Vec<Value>) {
+    if !has_applicant_type_requirement(rules)
+        && !reasons
+            .iter()
+            .any(|reason| reason.as_str() == Some(MISSING_APPLICANT_TYPE))
+    {
+        reasons.push(json!(MISSING_APPLICANT_TYPE));
+    }
+}
 
 fn arguments(op: &str) -> Result<&'static [&'static str]> {
     Ok(match op {
@@ -54,11 +78,15 @@ pub fn to_stored(value: &Value) -> Result<Value> {
         .context("requirements must be an array")?;
     let mut stored = value.clone();
     stored["schema_version"] = json!(2);
-    stored["review_reasons"] = if rules.is_empty() {
-        json!(["No requirements were extracted from the supplied sources"])
+    let mut reasons = if rules.is_empty() {
+        vec![json!(
+            "No requirements were extracted from the supplied sources"
+        )]
     } else {
-        json!([])
+        vec![]
     };
+    add_applicant_type_review(rules, &mut reasons);
+    stored["review_reasons"] = json!(reasons);
     Ok(stored)
 }
 
@@ -137,12 +165,9 @@ pub fn to_legacy(value: &Value) -> Result<Value> {
         .as_array()
         .context("review_reasons must be an array")?
         .clone();
-    // Applicant type is mandatory: without it, the engine cannot determine
-    // whether the bando applies to municipalities.
-    let has_applicant = expanded.iter().any(|r| r["blocker"] == "applicant");
-    if !has_applicant {
-        reasons.push(json!("No applicant-type requirement was extracted; cannot determine eligibility for municipalities"));
-    }
+    // Derive the same coverage warning for historical compact extractions without
+    // rewriting them, and do not duplicate warnings already persisted by to_stored.
+    add_applicant_type_review(rules, &mut reasons);
     let mut out = value.clone();
     out.as_object_mut().unwrap().remove("schema_version");
     out["needs_review"] = json!(!reasons.is_empty());
@@ -285,4 +310,82 @@ pub fn schema() -> Value {
         "closes_at":{"type":["string","null"],"description":"Application deadline as RFC3339 with explicit timezone; null if unknown. Never invent time/timezone."},
         "requirements":{"type":"array","items":{"anyOf":variants}},
         "citations":{"type":"array","items":citation}}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn facts(requirements: Value) -> Value {
+        json!({"schema_version":3, "title":"Funding call", "summary":"Source facts",
+            "status":"open", "opens_on":"2026-01-01", "closes_at":"2026-12-31T12:00:00Z",
+            "requirements":requirements, "citations":[{"id":"c1",
+                "source_url":"https://example.gov/call", "locator":null,
+                "quote":"Applicants must be registered in Italy."}]})
+    }
+
+    #[test]
+    fn missing_applicant_type_warning_is_persisted_once_and_diagnostics_agree() {
+        let live = facts(json!([{"id":"country", "label":"Country", "op":"equals",
+            "field":"entity.country", "value":"IT", "citation_ids":["c1"]}]));
+        let stored = to_stored(&live).unwrap();
+        assert_eq!(stored["schema_version"], 2);
+        assert_eq!(stored["review_reasons"], json!([MISSING_APPLICANT_TYPE]));
+        assert_eq!(stored["requirements"], live["requirements"]);
+        assert_eq!(
+            engine::extraction_review_reasons(&live),
+            engine::extraction_review_reasons(&stored)
+        );
+        let expanded = to_legacy(&stored).unwrap();
+        assert_eq!(expanded["needs_review"], true);
+        assert_eq!(expanded["review_reasons"], stored["review_reasons"]);
+        assert_eq!(expanded, to_legacy(&live).unwrap());
+
+        let mut historical = stored.clone();
+        historical["review_reasons"] = json!([]);
+        let unchanged = historical.clone();
+        assert_eq!(to_legacy(&historical).unwrap(), expanded);
+        assert_eq!(historical, unchanged);
+        assert_eq!(
+            engine::extraction_review_reasons(&historical),
+            engine::extraction_review_reasons(&stored)
+        );
+    }
+
+    #[test]
+    fn empty_requirements_keep_both_coverage_diagnostics_without_duplicates() {
+        let live = facts(json!([]));
+        let stored = to_stored(&live).unwrap();
+        assert_eq!(stored["review_reasons"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            to_legacy(&stored).unwrap()["review_reasons"],
+            stored["review_reasons"]
+        );
+        assert_eq!(
+            engine::extraction_review_reasons(&live),
+            engine::extraction_review_reasons(&stored)
+        );
+    }
+
+    #[test]
+    fn persisted_missing_type_warning_does_not_hide_a_definite_exclusion() {
+        let live = facts(json!([{"id":"country", "label":"Country", "op":"equals",
+            "field":"entity.country", "value":"EE", "citation_ids":["c1"]}]));
+        let mut stored = to_stored(&live).unwrap();
+        let municipality =
+            json!({"istatCode":"081001", "region":"Sicilia", "registryReferenceDate":"2026-10-06"});
+        let evaluate =
+            |call: &Value| engine::evaluate(call, &municipality, &[], None, "2026-10-06T12:00:00Z");
+        assert_eq!(evaluate(&stored), evaluate(&live));
+        assert_eq!(evaluate(&stored)["state"], "excluded");
+
+        stored["review_reasons"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("Original eligibility annex is unreadable"));
+        let result = evaluate(&stored);
+        assert_eq!(result["state"], "review_required");
+        assert_eq!(result["results"][0]["state"], "fail");
+        assert_eq!(result["visible"], true);
+    }
 }

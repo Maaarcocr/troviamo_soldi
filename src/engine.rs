@@ -461,6 +461,13 @@ pub fn extraction_review_reasons(value: &Value) -> Vec<String> {
         .flatten()
         .filter_map(|v| v.as_str().map(str::to_owned))
         .collect();
+    if matches!(value["schema_version"].as_u64(), Some(2 | 3))
+        && value["requirements"]
+            .as_array()
+            .is_some_and(|rules| !crate::contract::has_applicant_type_requirement(rules))
+    {
+        reasons.push(crate::contract::MISSING_APPLICANT_TYPE.into());
+    }
     if value["requirements"]
         .as_array()
         .is_some_and(|rules| rules.is_empty())
@@ -939,15 +946,26 @@ pub fn evaluate_for_call(
             "No confirmed application deadline; current opening status requires review"
         ));
     }
-    // Extraction uncertainty applies to the purported rules and dates themselves.
-    // Keep the raw failed-rule/closed-window details, but do not silently hide a
-    // notice whose annexes, conditions, or deadline have not been established.
-    let state = if extraction["needs_review"] == true || (!is_compact && missing_deadline) {
+    // Source uncertainty can invalidate the purported rules themselves. Missing
+    // applicant-type coverage only prevents a positive match: a separately cited,
+    // verified applicant mismatch remains sufficient to exclude the municipality.
+    // Historical global warnings and pipeline input-coverage failures keep their
+    // stronger review precedence.
+    let source_uncertainty = extraction["needs_review"] == true
+        && (!is_compact
+            || extraction["review_reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|reason| reason.as_str() != Some(crate::contract::MISSING_APPLICANT_TYPE)));
+    let state = if source_uncertainty || (!is_compact && missing_deadline) {
         "review_required"
     } else if window["state"] == "closed" {
         "closed"
     } else if applicant_failure {
         "excluded"
+    } else if extraction["needs_review"] == true {
+        "review_required"
     } else if any_failure {
         "ineligible"
     } else if window["state"] == "forthcoming" {
